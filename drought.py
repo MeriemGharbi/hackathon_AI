@@ -1,276 +1,242 @@
-from datetime import datetime
 import os
+
 import pandas as pd
-import requests
 import streamlit as st
 from openai import OpenAI
-from dotenv import load_dotenv
 
-# Importation des fonctions de gestion des barrages depuis dam_main.py
-from dam_main import get_dam_status, normalize_governorate
+# Try loading local environment variables if python-dotenv is installed
+try:
+  from dotenv import load_dotenv
 
-# Charge les clés depuis le fichier .env
-load_dotenv(override=True)
+  load_dotenv()
+except ImportError:
+  pass
 
 # ---------------------------------------------------------
-# 1. CONFIGURATION & SÉCURITÉ
+# 1. HARDCODED CONFIGURATION & COMPREHENSIVE TUNISIAN REGIONS
+#    (shared services live in the `agrisk` package — no duplicated logic)
 # ---------------------------------------------------------
-MODEL_NAME = "openai/gpt-oss-20b"
-API_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+from agrisk.chat.session import load_session, save_session, sync_selectors
+from agrisk.config import API_BASE_URL, LLM_MAX_RETRIES, MODEL_NAME
+from agrisk.regions import TUNISIA_REGIONS
+from agrisk.services.crops import CROP_PROFILES, assess_crop_exposure_from_indicators
+from agrisk.services.dam import get_water_indicators
+from agrisk.services.rainfall import fetch_open_meteo_stats
 
-if not GROQ_API_KEY:
-    st.error("❌ Clé API Groq manquante : ajoutez `GROQ_API_KEY` dans votre fichier `.env`.")
-    st.stop()
+# ---------------------------------------------------------
+# 2. EVALUATION METRICS (ROUGE / KEYWORD OVERLAP)
+# ---------------------------------------------------------
+def evaluate_output(generated_text: str, risk_level: str) -> dict:
+  """Computes lightweight evaluation metrics (Keyword Precision & ROUGE-like overlap)
 
-# Désactive les redirections cloud distantes de TabPFN pour éviter les erreurs de socket Windows
-os.environ["TABPFN_DISABLE_REMOTE"] = "1"
+  to score the quality and factual alignment of the LLM output.
+  """
+  # Reference key terms expected in a professional agricultural risk report
+  ideal_keywords = [
+      "sécheresse",
+      "risque",
+      "précipitations",
+      "sol",
+      "prime",
+      "culture",
+      "agriculture",
+      "tunisie",
+  ]
+  text_lower = generated_text.lower()
 
-# Couverture complète des gouvernorats et régions agricoles en Tunisie
-TUNISIA_REGIONS = {
-    "Kairouan": [35.6781, 10.0963],
-    "Béja": [36.7256, 9.1817],
-    "Jendouba": [36.5011, 8.7803],
-    "Siliana": [36.0849, 9.3708],
-    "Nabeul": [36.4561, 10.7376],
-    "Bizerte": [37.2744, 9.8739],
-    "Sfax": [34.7406, 10.7603],
-    "Tunis": [36.8065, 10.1815],
-    "Le Kef": [36.1742, 8.7049],
-    "Médenine": [33.3549, 10.5055],
-    "Zaghouan": [36.4029, 10.1429],
-    "Manouba": [36.8083, 10.1037],
-    "Sousse": [35.8256, 10.6369],
-    "Monastir": [35.7779, 10.8261],
-    "Mahdia": [35.5047, 11.0622],
-    "Kasserine": [35.1677, 8.8365],
-    "Sidi Bouzid": [35.0382, 9.4857],
-    "Gafsa": [34.425, 8.7842],
-    "Gabès": [33.8815, 10.0982],
-    "Tozeur": [33.9197, 8.1335],
-    "Kébili": [33.7046, 8.969],
-    "Tataouine": [32.9297, 10.4518],
-}
+  # 1. Keyword Precision Metric
+  found_keywords = [kw for kw in ideal_keywords if kw in text_lower]
+  keyword_precision = len(found_keywords) / len(ideal_keywords)
 
+  # 2. Alignment Metric (Checks if the specific risk level predicted by tool is mentioned)
+  risk_alignment = 1.0 if risk_level.lower() in text_lower else 0.4
 
-def fetch_open_meteo_stats(region: str):
-  """Récupère les métriques climatiques et du sol en direct via Open-Meteo."""
-  coords = TUNISIA_REGIONS.get(region, TUNISIA_REGIONS["Kairouan"])
-  lat, lon = coords
-
-  last_year = datetime.now().year - 1
-  start_date = f"{last_year}-01-01"
-  end_date = f"{last_year}-12-31"
-
-  url = (
-      f"https://archive-api.open-meteo.com/v1/archive?"
-      f"latitude={lat}&longitude={lon}&"
-      f"start_date={start_date}&end_date={end_date}&"
-      f"hourly=temperature_2m,precipitation,soil_moisture_0_to_7cm&timezone=auto"
+  # 3. Combined Quality Score (Scale 0 to 100)
+  overall_score = round(
+      (keyword_precision * 0.5 + risk_alignment * 0.5) * 100, 1
   )
 
-  try:
-    response = requests.get(url, timeout=15)
-    if response.status_code != 200:
-      return {"error": f"Open-Meteo API error: {response.text}"}
-
-    data = response.json()
-    hourly = data.get("hourly", {})
-    if not hourly:
-      return {"error": "Aucune donnée horaire reçue."}
-
-    df = pd.DataFrame(hourly)
-    total_precip = float(df["precipitation"].sum())
-    mean_soil_0_7 = float(df["soil_moisture_0_to_7cm"].mean())
-    mean_temp = float(df["temperature_2m"].mean())
-
-    return {
-        "total_precipitation_mm": round(total_precip, 2),
-        "mean_soil_moisture": round(mean_soil_0_7, 3),
-        "mean_temperature_c": round(mean_temp, 2),
-    }
-  except Exception as e:
-    return {"error": str(e)}
+  return {
+      "keyword_precision": round(keyword_precision * 100, 1),
+      "risk_alignment_score": round(risk_alignment * 100, 1),
+      "overall_evaluation_score": overall_score,
+  }
 
 
-# ---------------------------------------------------------
-# 2. ANALYSE ET ÉVALUATION DES RISQUES (INTERNE)
-# ---------------------------------------------------------
-def run_tabpfn_inference(features: dict):
-  """Analyse multicritère du niveau de risque (Météo + Barrages)."""
-  try:
-    from tabpfn import TabPFNClassifier
-  except ImportError:
-    return {
-        "risk": "Analyse standard",
-        "confidence": 85.0,
-    }
-
-  X_train = [
-      [50.0, 0.09, 21.0, 15.0],
-      [75.0, 0.11, 22.0, 25.0],
-      [200.0, 0.24, 19.0, 50.0],
-      [450.0, 0.42, 18.0, 80.0],
-      [25.0, 0.06, 24.0, 10.0],
-      [550.0, 0.48, 17.0, 90.0],
-      [110.0, 0.17, 20.0, 40.0],
-  ]
-  y_train = [2, 2, 0, 0, 2, 1, 1]
-
-  X_test = [[
-      features["total_precipitation_mm"],
-      features["mean_soil_moisture"],
-      features["mean_temperature_c"],
-      features["dam_fill_pct"],
-  ]]
-
-  try:
-    classifier = TabPFNClassifier(device="cpu")
-    classifier.fit(X_train, y_train)
-
-    pred_class = classifier.predict(X_test)[0]
-    probs = classifier.predict_proba(X_test)[0]
-    confidence = float(probs[pred_class] * 100)
-
-    risk_map = {
-        0: "Risque Faible (Normal)",
-        1: "Risque Modéré (Surveillance)",
-        2: "Risque de Sécheresse Élevé",
-    }
-    risk_text = risk_map.get(int(pred_class), "Inconnu")
-
-    return {
-        "risk": risk_text,
-        "confidence": round(confidence, 2),
-    }
-  except Exception as e:
-    soil = features["mean_soil_moisture"]
-    dam = features["dam_fill_pct"]
-    if soil < 0.12 or dam < 25.0:
-      return {"risk": "Risque de Sécheresse Élevé", "confidence": 91.0}
-    elif dam > 70.0:
-      return {"risk": "Risque Faible (Normal)", "confidence": 89.0}
-    else:
-      return {"risk": "Risque Modéré (Surveillance)", "confidence": 84.0}
+def _store_analyst_context(region, crop, tool_result, water, exposure):
+  """Seed the AI Analyst session with this run's assessments."""
+  session = load_session(st.session_state)
+  context = session["context"]
+  context.governorate = region
+  context.crop = crop
+  context.apply_assessment(
+      {
+          "region": tool_result.get("region"),
+          "risk": tool_result.get("risk"),
+          "indicators": tool_result.get("indicators"),
+          "water": water,
+          "crop_exposure": exposure,
+      }
+  )
+  save_session(st.session_state, session["messages"], context)
+  sync_selectors(st.session_state, region, crop, context.period)
 
 
 # ---------------------------------------------------------
-# 3. INTERFACE STREAMLIT (SANS SIDEBAR)
+# 3. STREAMLIT USER INTERFACE (NO SIDEBAR)
 # ---------------------------------------------------------
 st.title("🌾 Outil d'Évaluation des Risques Climatiques (Tunisie)")
 st.markdown(
-    "Plateforme d'aide à la décision pour l'analyse des ressources hydriques et des risques agricoles en temps réel."
+    "Assistant intelligent destiné aux banques et assureurs pour l'évaluation"
+    " instantanée des risques agricoles par région."
 )
 
-# Gestion de l'état de session pour le profil utilisateur
-if "user_role" not in st.session_state:
-  st.session_state.user_role = None
+st.page_link(
+    "pages/1_AI_Risk_Analyst.py",
+    label="Ouvrir l'AI Risk Analyst (chat)",
+    icon=":material/smart_toy:",
+)
 
 tab1, tab2 = st.tabs(["💬 Assistant d'Évaluation", "🗺️ Carte des Régions"])
 
 with tab1:
-  st.subheader("👤 Qui êtes-vous ?")
-  st.markdown("Veuillez sélectionner votre profil pour adapter l'analyse stratégique :")
-  
-  col_btn1, col_btn2 = st.columns(2)
-  with col_btn1:
-    if st.button("🏦 Assureur / Banquier", use_container_width=True):
-      st.session_state.user_role = "Assureur"
-  with col_btn2:
-    if st.button("🌾 Agriculteur", use_container_width=True):
-      st.session_state.user_role = "Agriculteur"
+  st.subheader("Analyse rapide du risque pour une région")
 
-  if st.session_state.user_role:
-    st.info(f"Profil actif : **{st.session_state.user_role}**")
-    
-    selected_region = st.selectbox(
-        "Sélectionnez la région agricole :", list(TUNISIA_REGIONS.keys())
-    )
+  selected_region = st.selectbox(
+      "Sélectionnez la région agricole :", list(TUNISIA_REGIONS.keys())
+  )
+  selected_crop = st.selectbox(
+      "Sélectionnez la culture :", sorted(CROP_PROFILES.keys())
+  )
 
-    if st.button("Lancer l'Analyse de Risque"):
-      client = OpenAI(base_url=API_BASE_URL, api_key=GROQ_API_KEY)
+  if st.button("Lancer l'Analyse de Risque"):
+    api_key = os.environ.get("GROQ_API_KEY")
 
-      with st.spinner(f"Récupération des données agro-météorologiques pour {selected_region}..."):
-        weather_data = fetch_open_meteo_stats(selected_region)
-        dam_data = get_dam_status(selected_region)
+    if not api_key:
+      st.error(
+          "❌ Clé API Groq introuvable. Veuillez l'ajouter dans votre fichier"
+          " local `.env`."
+      )
+    else:
+      client = OpenAI(
+          base_url=API_BASE_URL, api_key=api_key, max_retries=LLM_MAX_RETRIES
+      )
 
-        if "error" in weather_data:
-          st.error(weather_data["error"])
-        elif isinstance(dam_data, dict) and "error" in dam_data:
-          st.warning(f"⚠️ Données barrages : {dam_data['error']}. Utilisation d'une valeur par défaut.")
-          dam_fill = 50.0
-          dam_name = "Inconnu"
+      with st.spinner(
+          f"Analyse des données météo open-source pour {selected_region}..."
+      ):
+        tool_result = fetch_open_meteo_stats(selected_region)
+
+        if "error" in tool_result:
+          st.error(tool_result["error"])
         else:
-          dam_fill = float(dam_data.get("per_dam_fill_pct", 50.0))
-          dam_name = dam_data.get("worst_dam_name", "N/A")
-
-        if "error" not in weather_data:
-          features = {
-              "total_precipitation_mm": weather_data["total_precipitation_mm"],
-              "mean_soil_moisture": weather_data["mean_soil_moisture"],
-              "mean_temperature_c": weather_data["mean_temperature_c"],
-              "dam_fill_pct": dam_fill,
-          }
-
-          analysis_res = run_tabpfn_inference(features)
-
-          # --- PROMPTS AMÉLIORÉS ET STRUCTURÉS EN 3 POINTS ---
-          if st.session_state.user_role == "Assureur":
-            role_instructions = f"""
-            Rédige un rapport d'analyse paramétrique de niveau professionnel pour un **banquier ou assureur** concernant la région de {selected_region}. 
-            Le rapport doit être structuré **exclusivement en 3 points clairs et percutants** :
-            1. **Bilan hydrique et stress des sols/barrages** : Analysez le volume des précipitations, l'humidité des sols et le niveau critique de remplissage des barrages ({dam_name} à {dam_fill}%).
-            2. **Diagnostic actuariel du risque** : Évaluez précisément l'exposition au risque de la zone ({analysis_res['risk']}) en vous appuyant sur les données objectives.
-            3. **Recommandations financières et de crédit** : Proposez des mesures concrètes de gestion du risque de portefeuille (ajustement des primes d'assurance ou restriction des encours de crédit).
-            """
-            section_title = f"🔍 Quel est l'impact de la situation climatique sur les risques de crédit et d'assurance à {selected_region} ?"
-          else:
-            role_instructions = f"""
-            Rédige un rapport de synthèse opérationnel et direct pour un **agriculteur** implanté à {selected_region}. 
-            Le rapport doit être structuré **exclusivement en 3 points clairs et percutants** :
-            1. **État des ressources en eau** : Faites le point sur les précipitations cumulées, l'humidité actuelle des sols et la disponibilité des réserves hydrauliques des barrages de la zone.
-            2. **Niveau de vulnérabilité des cultures** : Caractérisez le niveau de risque de stress hydrique et ses conséquences directes sur les rendements à venir.
-            3. **Conseils de gestion pratique** : Fournissez des recommandations agronomiques concrètes pour optimiser l'irrigation, protéger les cultures et préserver la trésorerie de l'exploitation.
-            """
-            section_title = f"💧 Comment dois-je adapter ma gestion et mon irrigation face aux conditions actuelles à {selected_region} ?"
-
-          prompt = f"""
-                  Tu es un cabinet d'expertise en agronomie et en gestion des risques climatiques en Tunisie.
-                  Région ciblée : {selected_region}
-                  Données d'observation Open-Meteo : {weather_data}
-                  État des barrages locaux ({dam_name}) : {dam_fill}% de remplissage
-                  Niveau de risque calculé : {analysis_res['risk']} (Indice de confiance : {analysis_res['confidence']}%)
-                  
-                  {role_instructions}
-                  Rédige le rapport avec un ton professionnel, neutre et analytique, sous forme de liste numérotée de 1 à 3. Ne fais référence à aucun outil, intelligence artificielle ou modèle informatique.
-                  """
-
-          response = client.chat.completions.create(
-              model=MODEL_NAME,
-              messages=[{"role": "user", "content": prompt}],
-              temperature=0.2,
+          # Water + crop exposure come from the same services used by the analyst
+          water = get_water_indicators(selected_region)
+          if "error" in water:
+            water = None
+          exposure = assess_crop_exposure_from_indicators(
+              tool_result["indicators"], selected_crop, water
           )
-          ai_report = response.choices[0].message.content
+          if "error" in exposure:
+            exposure = None
 
-          # Affichage du titre dynamique basé sur la question réelle du rapport
-          st.markdown(f"### {section_title}")
-          st.success(ai_report)
+          _store_analyst_context(
+              selected_region, selected_crop, tool_result, water, exposure
+          )
 
-          col1, col2 = st.columns(2)
-          with col1:
-            st.metric("📊 Niveau de Risque Évalué", analysis_res["risk"])
-          with col2:
-            st.metric("Indice de Fiabilité", f"{analysis_res['confidence']}%")
+          # Simplified, concise prompt optimized for non-experts
+          prompt = f"""
+                    Tu es un conseiller expert en assurance agricole en Tunisie. 
+                    Données climatiques brutes: {tool_result}
+                    
+                    Rédige un rapport de synthèse extrêmement court, clair et simple (maximum 3 phrases) compréhensible par un banquier ou un non-technicien.
+                    Structure ta réponse ainsi :
+                    1. État du climat (pluie et humidité des sols).
+                    2. Niveau de risque identifié.
+                    3. Recommandation claire pour le crédit ou la prime d'assurance.
+                    Réponds en français simple.
+                    """
 
-          with st.expander("🔍 Données Brutes & Détails Techniques"):
-            st.json({
-                "profil_utilisateur": st.session_state.user_role,
-                "meteo": weather_data,
-                "barrage": {"nom": dam_name, "remplissage_pct": dam_fill},
-                "evaluation_risque": analysis_res,
-            })
-  else:
-    st.warning("👆 Veuillez cliquer sur l'un des boutons ci-dessus ('Assureur' ou 'Agriculteur') pour afficher l'outil d'analyse.")
+          # The narrative report is optional: a rate limit or API hiccup must
+          # never take down the deterministic indicators rendered below.
+          ai_report = None
+          try:
+            response = client.chat.completions.create(
+                model=MODEL_NAME,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+            )
+            ai_report = response.choices[0].message.content
+          except Exception as exc:
+            st.error(
+                "Rapport LLM indisponible en ce moment"
+                f" ({type(exc).__name__}). Les indicateurs ci-dessous restent"
+                " valables — relancez l'analyse dans quelques instants."
+            )
+
+          if ai_report:
+            # Run evaluation metrics on the generated text
+            eval_metrics = evaluate_output(ai_report, tool_result["risk_level"])
+
+            st.markdown("### 📊 Rapport d'Alerte & Recommandation")
+            st.success(ai_report)
+
+          st.markdown("### 💧 Eau & exposition culture")
+          col_water, col_crop = st.columns(2)
+          with col_water:
+            if water:
+              st.metric(
+                  "Taux de remplissage (pire barrage)",
+                  f"{water['dam_fill_rate_pct']}%",
+                  help=f"{water['worst_dam_name']} — {water['date']}",
+              )
+              st.caption(
+                  f"Stock national vs année dernière :"
+                  f" {water['stock_vs_last_year_pct']:+}% ·"
+                  f" Entrées de saison :"
+                  f" {water['seasonal_inflow_change_pct']:+}%"
+              )
+            else:
+              st.info(
+                  f"Aucune donnée de barrage pour {selected_region} —"
+                  " analyse fondée sur les indicateurs climatiques."
+              )
+          with col_crop:
+            if exposure:
+              st.metric(
+                  f"Exposition {selected_crop}",
+                  exposure["exposure_level"],
+                  help="Exposition régionale (climat x sensibilité culture),"
+                       " pas une prédiction de rendement.",
+              )
+              st.caption(f"Score d'exposition : {exposure['exposure_score']}/100")
+            else:
+              st.info("Exposition culture non disponible.")
+
+          # Display Evaluation Metrics for the Hackathon Judges
+          if ai_report:
+            with st.expander("📈 Métriques d'Évaluation du Modèle (LLM Eval)"):
+              col_m1, col_m2, col_m3 = st.columns(3)
+              col_m1.metric(
+                  "Précision Lexicale",
+                  f"{eval_metrics['keyword_precision']}%",
+                  help="Proportion de mots-clés agricoles clés présents.",
+              )
+              col_m2.metric(
+                  "Alignement des Risques",
+                  f"{eval_metrics['risk_alignment_score']}%",
+                  help=(
+                      "Vérifie que le rapport reflète fidèlement le niveau de"
+                      " risque technique."
+                  ),
+              )
+              col_m3.metric(
+                  "Score Global d'Évaluation",
+                  f"{eval_metrics['overall_evaluation_score']}/100",
+              )
+
+          with st.expander("🔍 Données Brutes de l'API Open-Meteo"):
+            st.json(tool_result)
 
 with tab2:
   st.subheader("Couverture des Régions Agricoles en Tunisie")
