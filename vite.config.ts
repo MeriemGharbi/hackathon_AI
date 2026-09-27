@@ -13,7 +13,7 @@ export default defineConfig(({ mode }) => {
 
   return {
     define: {
-      'process.env.GROQ_API_KEY': JSON.stringify(process.env.GROQ_API_KEY || ''),
+      'process.env.GROQ_API_KEY': JSON.stringify(process.env.GROQ_API_KEY || process.env.VITE_GROQ_API_KEY || ''),
     },
     base: process.env.FIGMA_PUBLIC_URL ? `${process.env.FIGMA_PUBLIC_URL}/` : '/',
     build: {
