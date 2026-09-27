@@ -797,7 +797,7 @@ function AssistantPage({
               <span>{m.role === "user" ? "You" : "AgriRisk AI Analyst"}</span>
               <span>{m.timestamp}</span>
             </div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
+            <FormattedText text={m.content} />
             {m.toolsUsed && m.toolsUsed.length > 0 && (
               <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid var(--border)", fontSize: 10, color: "var(--muted)", display: "flex", gap: 6, alignItems: "center" }}>
                 <Icon name="sparkles" size={12} />
