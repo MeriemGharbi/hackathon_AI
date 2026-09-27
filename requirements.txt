@@ -1,4 +1,8 @@
-pandas
 streamlit
-openai
+pandas
 requests
+openai
+python-dotenv
+tabpfn
+scikit-learn
+numpy
