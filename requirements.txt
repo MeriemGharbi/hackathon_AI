@@ -1,5 +1,9 @@
-pandas
 streamlit
+pandas
+requests
 openai
 requests
 python-dotenv
+tabpfn
+scikit-learn
+numpy
