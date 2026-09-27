@@ -22,7 +22,7 @@ def check(name, condition, detail=""):
 
 
 # --- dashboard ---------------------------------------------------------
-dashboard = AppTest.from_file("drought.py", default_timeout=120)
+dashboard = AppTest.from_file(os.path.join(os.path.dirname(__file__), "..", "drought.py"), default_timeout=120)
 dashboard.run()
 check("dashboard renders", not dashboard.exception, str(dashboard.exception))
 check("dashboard has region + crop selectboxes", len(dashboard.selectbox) >= 2)
@@ -53,7 +53,7 @@ else:
   check("dashboard analysis runs without exception", False, "button not found")
 
 # --- chat page ---------------------------------------------------------
-chat = AppTest.from_file(os.path.join("pages", "1_AI_Risk_Analyst.py"),
+chat = AppTest.from_file(os.path.join(os.path.dirname(__file__), "..", "pages", "1_AI_Risk_Analyst.py"),
                          default_timeout=120)
 chat.run()
 check("chat page renders", not chat.exception, str(chat.exception))

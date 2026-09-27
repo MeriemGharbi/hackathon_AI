@@ -1,0 +1,11 @@
+{
+  "title": "AgriRisk — Climate & Water Risk Intelligence for Tunisia",
+  "description": "This enterprise SaaS dashboard empowers banks, insurers, and agri firms in Tunisia to monitor and analyze regional climate and water risks, enhancing decision-making with data-driven insights.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
