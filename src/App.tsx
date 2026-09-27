@@ -861,7 +861,7 @@ function CropsPage({ selectedRegion, setSelectedRegion }: { selectedRegion: stri
               boxShadow: "0 4px 12px var(--shadow)",
               display: "flex",
               flexDirection: "column",
-              justify: "space-between",
+              justifyContent: "space-between",
             }}
           >
             <div>
