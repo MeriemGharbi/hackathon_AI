@@ -16,3 +16,6 @@ logs/
 .claude-replay.*
 .tmp-*
 /.figma/design-context/
+
+# Downloaded by tools/build_tunisia_geo.py; regenerate instead of committing.
+tools/cache/

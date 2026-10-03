@@ -1,9 +1,13 @@
+# Web API + dashboard hosting
+fastapi
+uvicorn
+pydantic
+
+# Streamlit demo app (drought.py, pages/)
 streamlit
+
+# Data + services
 pandas
 requests
-openai
-requests
 python-dotenv
-tabpfn
-scikit-learn
-numpy
+openai

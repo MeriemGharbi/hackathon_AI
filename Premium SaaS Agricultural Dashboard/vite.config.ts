@@ -12,8 +12,6 @@ export default defineConfig(({ mode }) => {
   const emitSourcemaps = mode === 'development'
 
   return {
-    // No `define` for secrets on purpose: the assistant is called through
-    // /api/chat, so GROQ_API_KEY must never be inlined into the client bundle.
     base: process.env.FIGMA_PUBLIC_URL ? `${process.env.FIGMA_PUBLIC_URL}/` : '/',
     build: {
       sourcemap: emitSourcemaps ? 'inline' : false,
@@ -36,15 +34,6 @@ react(),
       host: process.env.FIGMA_DEV_SERVER_HOST || '0.0.0.0',
       port: parseInt(process.env.PORT || '8443'),
       strictPort: true,
-      // The dev server only serves the dashboard, so same-origin /api calls are
-      // forwarded to a locally running FastAPI instance. Start it with:
-      //   python -m uvicorn api.index:app --port 8001
-      proxy: {
-        '/api': {
-          target: process.env.AGRIRISK_DEV_API || 'http://127.0.0.1:8001',
-          changeOrigin: true,
-        },
-      },
       watch: {
         ignored: [
           '**/.figma/**',

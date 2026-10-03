@@ -1,57 +1,104 @@
-import { useEffect, useMemo, useState, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import TunisiaMap, { RISK_TONE_LABEL, RISK_TONE_ORDER, toneForLevel, type RiskTone } from "./components/TunisiaMap";
+import LineChart, { Bar } from "./components/LineChart";
+import { Button, DataState, Panel, RiskPill, Segmented, Select, SourceNote, Spinner, Stat } from "./components/ui";
+import { api, type Assessment, type RiskLevel } from "./lib/api";
 import {
-  getDamStatusForGovernorate,
-  LATEST_DAM_STATS,
-  TUNISIA_DAMS,
-} from "./data/damData";
+  useAssessment,
+  useClimate,
+  useCropExposure,
+  useCropProfiles,
+  useDamHistory,
+  useDebounced,
+  useHealth,
+  useNational,
+  useReference,
+  useReports,
+  useScenario,
+  useWaterHistory,
+  useWaterSummary,
+} from "./lib/hooks";
 import {
-  CROP_PROFILES,
-  calculateCropExposure,
-  getCropList,
-  type CropProfile,
-} from "./data/cropData";
-import {
-  fetchOpenMeteoStats,
-  generateAiRiskReport,
-  runTabpfnInference,
-  sendAiAssistantChatMessage,
-  TUNISIA_REGIONS,
-  type RiskAnalysisResult,
-  type UserRole,
-  type WeatherStats,
-  type ChatMessage,
-} from "./services/droughtEngine";
+  downloadText,
+  exposureTone,
+  formatDate,
+  formatMonth,
+  int,
+  mean,
+  num,
+  pct,
+  quarterOf,
+  renderInlineMarkdown,
+  riskTone,
+  signed,
+  signedPct,
+  toCsv,
+} from "./lib/format";
 
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+type UserRole = "Insurer / Analyst" | "Farmer / Specialist";
+
+type PageKey =
+  | "Overview"
+  | "Assistant"
+  | "Crops"
+  | "Regions"
+  | "Water"
+  | "Climate"
+  | "Scenarios"
+  | "Reports";
+
+interface ChatMessage {
+  role: "user" | "assistant";
+  content: string;
+  toolsUsed?: string[];
+}
+
+const NAV: { key: PageKey; icon: IconName }[] = [
+  { key: "Overview", icon: "overview" },
+  { key: "Assistant", icon: "sparkles" },
+  { key: "Crops", icon: "sprout" },
+  { key: "Regions", icon: "regions" },
+  { key: "Water", icon: "water" },
+  { key: "Climate", icon: "climate" },
+  { key: "Scenarios", icon: "scenarios" },
+  { key: "Reports", icon: "reports" },
+];
+
+const LEVEL_RANK: Record<string, number> = { VERY_HIGH: 0, HIGH: 1, MODERATE: 2, LOW: 3 };
+
+// ---------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------
 type IconName =
-  | "overview" | "map" | "regions" | "water" | "climate" | "scenarios"
-  | "reports" | "search" | "calendar" | "sun" | "moon" | "arrow"
-  | "download" | "chevron" | "sparkles" | "x" | "user" | "sprout" | "bot" | "crops" | "send";
+  | "overview" | "regions" | "water" | "climate" | "scenarios" | "reports"
+  | "search" | "sun" | "moon" | "download" | "sparkles" | "x"
+  | "arrow" | "send" | "sprout" | "refresh" | "alert" | "chevron";
 
-const iconPaths: Record<IconName, React.ReactNode> = {
-  overview: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
-  map: <><path d="m3 6 5-3 8 3 5-3v15l-5 3-8-3-5 3V6Z"/><path d="M8 3v15M16 6v15"/></>,
-  regions: <><path d="M4 20h16M6 20V8h4v12M14 20V4h4v16"/><path d="M7.5 11h1M15.5 7h1M15.5 11h1M15.5 15h1"/></>,
-  water: <path d="M12 2S5 10 5 15a7 7 0 0 0 14 0c0-5-7-13-7-13Z"/>,
-  climate: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></>,
-  scenarios: <><path d="M4 6h7M15 6h5M4 12h3M11 12h9M4 18h9M17 18h3"/><circle cx="13" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="15" cy="18" r="2"/></>,
-  reports: <><path d="M6 2h9l4 4v16H6V2Z"/><path d="M14 2v5h5M9 12h6M9 16h6"/></>,
-  search: <><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></>,
-  calendar: <><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M16 3v4M8 3v4M3 10h18"/></>,
-  sun: <><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M19.1 19.1l-1.4-1.4M4.9 19.1l1.4-1.4M19.1 4.9l-1.4 1.4"/></>,
-  moon: <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/>,
-  arrow: <><path d="M5 12h14M13 6l6 6-6 6"/></>,
-  download: <><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></>,
-  chevron: <path d="m9 18 6-6-6-6"/>,
-  sparkles: <path d="m12 3 1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3Z"/>,
-  x: <path d="M18 6 6 18M6 6l12 12"/>,
-  user: <><path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></>,
-  sprout: <path d="M7 20h10M12 20v-8M12 12A6 6 0 0 1 6 6c0 4 3 6 6 6Zm0 0a6 6 0 0 0 6-6c0 4-3 6-6 6Z"/>,
-  bot: <><rect x="3" y="11" width="18" height="10" rx="2"/><circle cx="12" cy="5" r="2"/><path d="M12 7v4M8 15h.01M16 15h.01"/></>,
-  crops: <path d="M7 20h10M12 20v-8M12 12A6 6 0 0 1 6 6c0 4 3 6 6 6Zm0 0a6 6 0 0 0 6-6c0 4-3 6-6 6Z"/>,
-  send: <path d="m22 2-7 20-4-9-9-4Zm0 0L11 13"/>,
+const ICON_PATHS: Record<IconName, React.ReactNode> = {
+  overview: <><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></>,
+  regions: <><path d="M4 20h16M6 20V8h4v12M14 20V4h4v16" /><path d="M7.5 11h1M15.5 7h1M15.5 11h1M15.5 15h1" /></>,
+  water: <path d="M12 2S5 10 5 15a7 7 0 0 0 14 0c0-5-7-13-7-13Z" />,
+  climate: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" /></>,
+  scenarios: <><path d="M4 6h7M15 6h5M4 12h3M11 12h9M4 18h9M17 18h3" /><circle cx="13" cy="6" r="2" /><circle cx="9" cy="12" r="2" /><circle cx="15" cy="18" r="2" /></>,
+  reports: <><path d="M6 2h9l4 4v16H6V2Z" /><path d="M14 2v5h5M9 12h6M9 16h6" /></>,
+  search: <><circle cx="11" cy="11" r="7" /><path d="m20 20-4-4" /></>,
+  sun: <><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M19.1 19.1l-1.4-1.4M4.9 19.1l1.4-1.4M19.1 4.9l-1.4 1.4" /></>,
+  moon: <path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z" />,
+  download: <><path d="M12 3v12M7 10l5 5 5-5M5 21h14" /></>,
+  sparkles: <path d="m12 3 1.912 5.813a2 2 0 0 0 1.275 1.275L21 12l-5.813 1.912a2 2 0 0 0-1.275 1.275L12 21l-1.912-5.813a2 2 0 0 0-1.275-1.275L3 12l5.813-1.912a2 2 0 0 0 1.275-1.275L12 3Z" />,
+  x: <path d="M18 6 6 18M6 6l12 12" />,
+  arrow: <><path d="M5 12h14M13 6l6 6-6 6" /></>,
+  send: <path d="m22 2-7 20-4-9-9-4Zm0 0L11 13" />,
+  sprout: <path d="M7 20h10M12 20v-8M12 12A6 6 0 0 1 6 6c0 4 3 6 6 6Zm0 0a6 6 0 0 0 6-6c0 4-3 6-6 6Z" />,
+  refresh: <><path d="M3 12a9 9 0 0 1 15.5-6.2M21 12a9 9 0 0 1-15.5 6.2" /><path d="M18 3v4h-4M6 21v-4h4" /></>,
+  alert: <><circle cx="12" cy="12" r="9" /><path d="M12 8v5M12 16h.01" /></>,
+  chevron: <path d="m9 6 6 6-6 6" />,
 };
 
-function Icon({ name, size = 17 }: { name: IconName; size?: number }) {
+function Icon({ name, size = 15 }: { name: IconName; size?: number }) {
   return (
     <svg
       width={size}
@@ -59,1372 +106,2144 @@ function Icon({ name, size = 17 }: { name: IconName; size?: number }) {
       viewBox="0 0 24 24"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.6"
+      strokeWidth={1.6}
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
     >
-      {iconPaths[name]}
+      {ICON_PATHS[name]}
     </svg>
   );
 }
 
-function Action({
-  children,
-  className = "",
-  onClick,
+// ---------------------------------------------------------------------------
+// Shared page furniture
+// ---------------------------------------------------------------------------
+function PageIntro({
+  eyebrow,
+  title,
+  description,
+  actions,
 }: {
-  children: React.ReactNode;
-  className?: string;
-  onClick?: () => void;
+  eyebrow: string;
+  title: string;
+  description?: React.ReactNode;
+  actions?: React.ReactNode;
 }) {
   return (
-    <div
-      className={`action ${className}`}
-      role="button"
-      tabIndex={0}
-      onClick={onClick}
-      onKeyDown={(e) => e.key === "Enter" && onClick?.()}
-    >
-      {children}
+    <div className="page-intro">
+      <div>
+        <p className="section-label">{eyebrow}</p>
+        <h1 className="page-title">{title}</h1>
+        {description ? <p>{description}</p> : null}
+      </div>
+      {actions ? <div className="panel-actions">{actions}</div> : null}
     </div>
   );
 }
 
-const nav = [
-  ["Overview", "overview"],
-  ["AI Assistant", "bot"],
-  ["Crops", "crops"],
-  ["Regions", "regions"],
-  ["Water", "water"],
-  ["Climate", "climate"],
-  ["Scenarios", "scenarios"],
-  ["Reports", "reports"],
-] as const;
-
-function RiskPill({ children }: { children: React.ReactNode }) {
-  const text = String(children).toLowerCase();
-  const tone = text.includes("high") || text.includes("severe") || text.includes("critical") ? "high" : text.includes("mod") || text.includes("watch") ? "medium" : "low";
-  return <span className={`risk-pill ${tone}`}><i></i>{children}</span>;
-}
-
-/**
- * Realistic Tunisia Map Component (viewBox 0 0 100 130)
- */
-function TunisiaMap({
-  selected,
-  setSelected,
+function GovernorateField({
+  value,
+  options,
+  onChange,
 }: {
-  selected: string;
-  setSelected: (region: string) => void;
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
 }) {
-  const governorateList = useMemo(() => Object.values(TUNISIA_REGIONS), []);
-
-  return (
-    <div className="map-stage" style={{ height: 440 }}>
-      <svg className="tunisia" viewBox="0 0 100 130" aria-label="Governorate risk map of Tunisia">
-        <path
-          className="country"
-          d="M 32 8 C 40 4, 50 3, 54 4 C 58 4, 66 10, 74 18 C 76 22, 70 27, 65 30 C 66 36, 70 42, 68 50 C 65 56, 68 64, 64 72 C 58 76, 54 80, 56 86 C 62 88, 66 94, 62 100 C 58 110, 50 125, 46 126 C 40 120, 32 105, 30 92 C 25 80, 24 64, 25 48 C 26 32, 28 20, 32 8 Z"
-        />
-        <g className="boundaries">
-          <path d="M 32 18 L 68 20 M 28 32 L 64 34 M 26 48 L 66 50 M 26 64 L 64 68 M 30 80 L 58 84 M 32 96 L 60 98" />
-          <path d="M 46 6 L 44 48 M 56 12 L 52 72 M 36 48 L 34 92" />
-        </g>
-        {governorateList.map((gov) => {
-          const isSelected = selected === gov.name;
-          const damInfo = getDamStatusForGovernorate(gov.name);
-          const riskLevel = damInfo.per_dam_fill_pct < 30 ? "high" : damInfo.per_dam_fill_pct < 45 ? "medium" : "low";
-
-          return (
-            <g
-              key={gov.name}
-              className={`map-point ${riskLevel} ${isSelected ? "selected" : ""}`}
-              onClick={() => setSelected(gov.name)}
-              role="button"
-              tabIndex={0}
-            >
-              <circle cx={gov.x} cy={gov.y} r={isSelected ? 2.8 : 1.9} />
-              {isSelected && <circle className="selection-ring" cx={gov.x} cy={gov.y} r="4.8" />}
-            </g>
-          );
-        })}
-      </svg>
-      <span className="map-label label-bizerte" onClick={() => setSelected("Bizerte")}>Bizerte</span>
-      <span className="map-label label-tunis" onClick={() => setSelected("Tunis")}>Tunis</span>
-      <span className="map-label label-kef" onClick={() => setSelected("Le Kef")}>Le Kef</span>
-      <span className="map-label label-kairouan" onClick={() => setSelected("Kairouan")}>Kairouan</span>
-      <span className="map-label label-sfax" onClick={() => setSelected("Sfax")}>Sfax</span>
-      <span className="map-label label-gabes" onClick={() => setSelected("Gabès")}>Gabès</span>
-    </div>
-  );
+  return <Select label="Governorate" id="gov" value={value} options={options} onChange={onChange} />;
 }
 
-function LineChart({ type = "water" }: { type?: "water" | "rain" }) {
-  const water = "M4 48 C38 45 62 42 91 48 S145 55 174 61 S227 68 254 77 S306 85 356 91";
-  const rain = "M4 72 C31 63 59 77 88 57 S140 71 174 55 S222 73 253 82 S304 63 356 86";
-  const average = "M4 55 C55 53 112 57 174 59 S292 61 356 60";
+function Markdown({ text }: { text: string }) {
   return (
-    <svg className={`line-chart ${type}`} viewBox="0 0 360 110" preserveAspectRatio="none">
-      <g className="gridlines"><path d="M0 20H360M0 55H360M0 90H360"/></g>
-      <path className="benchmark" d={average} fill="none" strokeDasharray="4 4"/>
-      <path className="primary-line" d={type === "water" ? water : rain} fill="none"/>
-      <circle cx="356" cy={type === "water" ? 91 : 86} r="3"/>
-    </svg>
-  );
-}
-
-function MiniTrend({ values }: { values: number[] }) {
-  const points = values.map((value, index) => `${index * 7},${38 - value * 0.55}`).join(" ");
-  return (
-    <svg viewBox="0 0 77 28" className="mini-trend">
-      <polyline points={points} fill="none" />
-    </svg>
-  );
-}
-
-function Indicators() {
-  const values = [
-    ["Water Availability", `${LATEST_DAM_STATS.nationalStockMm3}`, "Mm³", "−14.8% YoY"],
-    ["Average Dam Fill", `${LATEST_DAM_STATS.meanFillPct}`, "%", "−6.2 pts"],
-    ["Rainfall Anomaly", "−21.3", "%", "vs 30-yr norm"],
-    ["Seasonal Inflow", `${LATEST_DAM_STATS.currentSeasonInflowMm3}`, "Mm³", "−28.5% YoY"],
-    ["Overall Risk", "73", "/100", "HIGH"],
-  ];
-  return (
-    <section className="indicator-strip">
-      {values.map(([label, value, unit, context], index) => (
-        <div className={`indicator ${index === 4 ? "risk" : ""}`} key={label}>
-          <span>{label}</span>
-          <div>
-            <strong>{value}</strong>
-            <small>{unit}</small>
-          </div>
-          <p>{context}</p>
-        </div>
+    <>
+      {text.split("\n\n").map((block, index) => (
+        <p key={index} className="md-block">
+          {renderInlineMarkdown(block)}
+        </p>
       ))}
-    </section>
+    </>
   );
 }
 
-function RoleSwitcher({ userRole, setUserRole }: { userRole: UserRole; setUserRole: (r: UserRole) => void }) {
+const RISK_COUNT_KEY: Record<string, string> = {
+  low: "LOW",
+  moderate: "MODERATE",
+  high: "HIGH",
+  veryHigh: "VERY_HIGH",
+};
+
+function Legend({ showCount, counts }: { showCount?: boolean; counts?: Record<string, number> }) {
   return (
-    <div className="role-switcher">
-      <button
-        className={`role-btn ${userRole === "Insurer / Analyst" ? "active" : ""}`}
-        onClick={() => setUserRole("Insurer / Analyst")}
-      >
-        Insurer / Analyst
-      </button>
-      <button
-        className={`role-btn ${userRole === "Farmer / Specialist" ? "active" : ""}`}
-        onClick={() => setUserRole("Farmer / Specialist")}
-      >
-        Farmer / Specialist
-      </button>
-    </div>
+    <>
+      {RISK_TONE_ORDER.map((tone) => (
+        <span key={tone}>
+          <i className={`swatch tone-${tone}`} />
+          {RISK_TONE_LABEL[tone]}
+          {showCount && counts ? <b>{counts[RISK_COUNT_KEY[tone]] ?? 0}</b> : null}
+        </span>
+      ))}
+      <span>
+        <i className="swatch tone-unknown" />
+        No data
+      </span>
+    </>
   );
 }
 
-function Overview({
+function toneFromText(level: string | null | undefined): RiskTone {
+  return riskTone(level as RiskLevel);
+}
+
+// ---------------------------------------------------------------------------
+// Overview
+// ---------------------------------------------------------------------------
+function OverviewPage({
+  period,
+  periodLabel,
   userRole,
-  setUserRole,
-  selectedRegion,
-  setSelectedRegion,
-  onNavigateToRegions,
+  region,
+  setRegion,
+  governorates,
+  crops,
+  setPage,
 }: {
+  period: string;
+  periodLabel: string;
   userRole: UserRole;
-  setUserRole: (r: UserRole) => void;
-  selectedRegion: string;
-  setSelectedRegion: (r: string) => void;
-  onNavigateToRegions: () => void;
+  region: string;
+  setRegion: (value: string) => void;
+  governorates: string[];
+  crops: string[];
+  setPage: (page: PageKey) => void;
 }) {
-  const [loading, setLoading] = useState(false);
-  const [selectedCrop, setSelectedCrop] = useState<string>("All Crops");
-  const [reportData, setReportData] = useState<{ title: string; report: string } | null>(null);
-  const [analysisResult, setAnalysisResult] = useState<RiskAnalysisResult | null>(null);
-  const [showTechnical, setShowTechnical] = useState(false);
-  const [techJson, setTechJson] = useState<any>(null);
+  const national = useNational(period);
+  const history = useWaterHistory(24);
+  const points = national.data?.points ?? [];
+  const byName = useMemo(() => new Map(points.map((point) => [point.name, point])), [points]);
+  const selected = byName.get(region);
+  const summary = national.data?.summary;
+  const coverage = national.data?.coverage;
 
-  const damInfo = useMemo(() => getDamStatusForGovernorate(selectedRegion), [selectedRegion]);
-  const cropList = useMemo(() => ["All Crops", ...getCropList()], []);
+  const ranked = useMemo(
+    () =>
+      [...points]
+        .filter((point) => point.risk_level)
+        .sort(
+          (a, b) =>
+            (LEVEL_RANK[a.risk_level ?? "LOW"] ?? 9) - (LEVEL_RANK[b.risk_level ?? "LOW"] ?? 9) ||
+            (a.rainfall_anomaly_pct ?? 0) - (b.rainfall_anomaly_pct ?? 0),
+        )
+        .slice(0, 8),
+    [points],
+  );
 
-  const activeCropProfile = useMemo(() => {
-    return selectedCrop !== "All Crops" ? CROP_PROFILES[selectedCrop] : null;
-  }, [selectedCrop]);
-
-  const watchlist = [
-    ["Kairouan", "High", "Severe", "−34.2%", "Rising"],
-    ["Sidi Bouzid", "High", "Severe", "−29.8%", "Rising"],
-    ["Sfax", "High", "Elevated", "−26.1%", "Stable"],
-    ["Jendouba", "Low", "Moderate", "−5.8%", "Improving"],
-  ];
-
-  const handleRunAnalysis = async () => {
-    setLoading(true);
-    setReportData(null);
-
-    const weather = await fetchOpenMeteoStats(selectedRegion);
-    const dam = getDamStatusForGovernorate(selectedRegion);
-    const analysisRes = runTabpfnInference({
-      total_precipitation_mm: weather.total_precipitation_mm,
-      mean_soil_moisture: weather.mean_soil_moisture,
-      mean_temperature_c: weather.mean_temperature_c,
-      dam_fill_pct: dam.per_dam_fill_pct,
-    });
-
-    setAnalysisResult(analysisRes);
-
-    const res = await generateAiRiskReport(selectedRegion, userRole, weather, dam, analysisRes, selectedCrop);
-
-    const cropExp = selectedCrop !== "All Crops"
-      ? calculateCropExposure(selectedCrop, weather.total_precipitation_mm, weather.mean_soil_moisture, dam.per_dam_fill_pct)
+  const series = history.data?.series ?? [];
+  const latest = series[series.length - 1] ?? null;
+  const stockDelta =
+    latest?.national_stock_mm3 != null && latest.three_year_average_mm3
+      ? (latest.national_stock_mm3 / latest.three_year_average_mm3 - 1) * 100
+      : null;
+  const inflowDelta =
+    latest?.current_season_inflow_mm3 != null && latest.previous_season_inflow_mm3
+      ? (latest.current_season_inflow_mm3 / latest.previous_season_inflow_mm3 - 1) * 100
       : null;
 
-    setTechJson({
-      user_profile: userRole,
-      target_crop: selectedCrop !== "All Crops" ? selectedCrop : "General Agriculture",
-      weather_data: weather,
-      reservoir_status: { name: dam.worst_dam_name, fill_pct: dam.per_dam_fill_pct },
-      risk_assessment: analysisRes,
-      crop_exposure: cropExp,
-    });
+  const dates = series.map((point) => point.date);
+  const counts = summary?.risk_counts ?? {};
+  const severe = (counts.HIGH ?? 0) + (counts.VERY_HIGH ?? 0);
+  const executive = national.data
+    ? [
+        `${severe} of ${coverage?.assessed ?? 0} governorates are at high or very high drought risk.`,
+        summary?.highest_risk?.governorate
+          ? `${summary.highest_risk.governorate} carries the highest modelled risk (${summary.highest_risk.risk_label}).`
+          : null,
+        `National rainfall is ${signedPct(summary?.mean_rainfall_anomaly_pct)} against the previous 12 months, mean dam fill is ${num(summary?.mean_dam_fill_pct, 1)}% and ${coverage?.with_dam_data ?? 0} governorates have reservoir monitoring.`,
+      ]
+        .filter(Boolean)
+        .join(" ")
+    : "Assessing all governorates against measured climate and reservoir data…";
 
-    setReportData(res);
-    setLoading(false);
-  };
+  return (
+    <>
+      <PageIntro
+        eyebrow={`National overview · ${periodLabel}`}
+        title="Tunisia agricultural risk"
+        description="Measured precipitation and soil moisture from Open-Meteo, reservoir levels from the AgriRisk dam dataset, classified by the AgriRisk risk model."
+        actions={
+          <>
+            <Button onClick={national.reload} title="Reload national assessment">
+              <Icon name="refresh" size={14} /> Refresh
+            </Button>
+            <Button
+              variant="primary"
+              disabled={!points.length}
+              onClick={() =>
+                downloadText(
+                  `AgriRisk_national_${period}.csv`,
+                  toCsv(
+                    ["governorate", "risk_level", "risk_label", "precipitation_mm", "rainfall_anomaly_pct", "soil_moisture_0_7cm", "et0_total_mm", "dam_fill_pct"],
+                    points.map((point) => [
+                      point.name,
+                      point.risk_level,
+                      point.risk_label,
+                      point.precipitation_mm,
+                      point.rainfall_anomaly_pct,
+                      point.mean_soil_moisture_0_7cm,
+                      point.et0_total_mm,
+                      point.dam_fill_rate_pct,
+                    ]),
+                  ),
+                  "text/csv",
+                )
+              }
+            >
+              <Icon name="download" size={14} /> Export national
+            </Button>
+          </>
+        }
+      />
 
-  const downloadBrief = () => {
-    const text = `TUNISIA AGRICULTURAL RISK BRIEF (${selectedRegion})
-Date: ${new Date().toLocaleDateString()}
-Profile: ${userRole}
-Crop Focus: ${selectedCrop}
-Reference Reservoir: ${damInfo.worst_dam_name} (${damInfo.per_dam_fill_pct}% fill)
-National Stock: ${LATEST_DAM_STATS.nationalStockMm3} Mm³
-Mean Fill Rate: ${LATEST_DAM_STATS.meanFillPct}%
+      <div className="executive-summary">
+        <span>Brief</span>
+        <p>{executive}</p>
+        <small>
+          {coverage ? `${coverage.assessed}/${coverage.requested} governorates assessed` : "loading coverage"}
+          {national.data?.failures?.length ? ` · ${national.data.failures.length} failed` : ""}
+        </small>
+      </div>
 
-${reportData ? reportData.title + "\n\n" + reportData.report : "Run risk assessment to generate complete report."}`;
+      <DataState loading={national.loading} error={national.error}>
+        <section className="indicator-strip">
+          <Stat
+            label="National water stock"
+            value={num(latest?.national_stock_mm3, 1)}
+            unit="Mm³"
+            context={stockDelta == null ? "no comparison window" : `${signedPct(stockDelta)} vs 3-year average`}
+          />
+          <Stat
+            label="Mean dam fill"
+            value={num(summary?.mean_dam_fill_pct, 1)}
+            unit="%"
+            context={`${coverage?.with_dam_data ?? 0} governorates monitored`}
+          />
+          <Stat
+            label="Rainfall anomaly"
+            value={num(summary?.mean_rainfall_anomaly_pct, 1)}
+            unit="%"
+            context={
+              (summary?.mean_rainfall_anomaly_pct ?? 0) < -15
+                ? "drier than the previous 12 months"
+                : "national mean vs previous 12 months"
+            }
+          />
+          <Stat
+            label="Seasonal inflow"
+            value={num(latest?.current_season_inflow_mm3, 1)}
+            unit="Mm³"
+            context={inflowDelta == null ? "no prior season" : `${signedPct(inflowDelta)} vs previous`}
+          />
+          <Stat
+            label="Highest risk"
+            value={summary?.highest_risk?.governorate ?? "—"}
+            context={
+              summary?.highest_risk
+                ? `${RISK_TONE_LABEL[toneFromText(summary.highest_risk.risk_level)]} risk`
+                : "no assessments"
+            }
+            emphasis
+          />
+        </section>
 
-    const blob = new Blob([text], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `Risk_Analysis_${selectedRegion}_${selectedCrop.replace(/\s+/g, "_")}_${userRole.includes("Insurer") ? "Insurer" : "Farmer"}.txt`;
-    a.click();
-    URL.revokeObjectURL(url);
+        <div className="overview-grid">
+          <Panel
+            className="map-panel"
+            title="Governorate drought risk"
+            subtitle={`${coverage?.assessed ?? 0} governorates · GADM ADM1 boundaries · click a region to inspect`}
+            legend={<Legend showCount counts={summary?.risk_counts} />}
+          >
+            <DataState loading={national.loading} error={national.error}>
+              <TunisiaMap
+                points={points}
+                selected={region}
+                onSelect={setRegion}
+                loading={national.loading}
+                height={430}
+              />
+            </DataState>
+
+            <div className="selected-region">
+              <div>
+                <span>Governorate</span>
+                <strong>{region}</strong>
+              </div>
+              <div>
+                <span>Risk level</span>
+                <RiskPill tone={toneForLevel(selected?.risk_level)}>{selected?.risk_label ?? "No data"}</RiskPill>
+              </div>
+              <div>
+                <span>Precipitation (12m)</span>
+                <strong>{num(selected?.precipitation_mm, 1)} mm</strong>
+              </div>
+              <div>
+                <span>Anomaly</span>
+                <strong>{signedPct(selected?.rainfall_anomaly_pct)}</strong>
+              </div>
+              <div className="action">
+                <Button variant="ghost" onClick={() => setPage("Regions")}>
+                  Analyse <Icon name="arrow" size={13} />
+                </Button>
+              </div>
+            </div>
+
+            {selected && selected.dam_fill_rate_pct == null ? (
+              <div className="watch-note">
+                <span>Coverage note</span>
+                <p>
+                  No reservoir monitoring for {region}; this region is assessed on climate indicators only.
+                </p>
+              </div>
+            ) : null}
+          </Panel>
+
+          <Panel
+            className="watchlist"
+            title="Priority governorates"
+            subtitle="Ranked by AgriRisk model risk, then rainfall anomaly"
+            actions={
+              <Button variant="ghost" onClick={() => setPage("Regions")}>
+                All regions <Icon name="arrow" size={13} />
+              </Button>
+            }
+          >
+            <div className="data-row table-head">
+              <span>Governorate</span>
+              <span>Risk</span>
+              <span>Rainfall</span>
+              <span>Anomaly</span>
+              <span>Dam fill</span>
+            </div>
+            {ranked.map((point) => (
+              <button
+                type="button"
+                key={point.name}
+                className={`data-row row-button${point.name === region ? " is-selected" : ""}`}
+                onClick={() => setRegion(point.name)}
+              >
+                <strong>{point.name}</strong>
+                <span>
+                  <RiskPill tone={toneForLevel(point.risk_level)}>{point.risk_label}</RiskPill>
+                </span>
+                <span>{num(point.precipitation_mm, 0)} mm</span>
+                <span className="mono">{signedPct(point.rainfall_anomaly_pct)}</span>
+                <span>{pct(point.dam_fill_rate_pct)}</span>
+              </button>
+            ))}
+            {!ranked.length && !national.loading ? (
+              <div className="data-row is-empty">No governorate assessments were returned.</div>
+            ) : null}
+          </Panel>
+        </div>
+
+        <div className="chart-grid">
+          <Panel
+            className="chart-panel"
+            title="National water stock"
+            subtitle="Measured monthly total against the three-year average"
+            actions={
+              latest ? (
+                <div className="chart-stat">
+                  <strong>{num(latest.national_stock_mm3, 1)} Mm³</strong>
+                  <span>{stockDelta == null ? "" : signedPct(stockDelta)}</span>
+                </div>
+              ) : null
+            }
+          >
+            <DataState loading={history.loading} error={history.error} empty={!series.length}>
+              <LineChart
+                dates={dates}
+                unit="Mm³"
+                valueSuffix=" Mm³"
+                series={[
+                  { key: "stock", label: "National stock", values: series.map((p) => p.national_stock_mm3) },
+                  {
+                    key: "avg",
+                    label: "Three-year average",
+                    values: series.map((p) => p.three_year_average_mm3),
+                    dashed: true,
+                  },
+                ]}
+              />
+            </DataState>
+          </Panel>
+
+          <Panel
+            className="chart-panel"
+            title="Reservoir stock by zone"
+            subtitle="Latest measured stock per hydrological zone"
+            actions={
+              latest ? (
+                <div className="chart-stat">
+                  <strong>
+                    {num((latest.north_mm3 ?? 0) + (latest.centre_mm3 ?? 0) + (latest.cap_bon_mm3 ?? 0), 0)} Mm³
+                  </strong>
+                  <span>all zones</span>
+                </div>
+              ) : null
+            }
+          >
+            <DataState loading={history.loading} error={history.error} empty={!series.length}>
+              <LineChart
+                dates={dates}
+                unit="Mm³"
+                valueSuffix=" Mm³"
+                series={[
+                  { key: "north", label: "North", values: series.map((p) => p.north_mm3), color: "#3f6f52" },
+                  { key: "centre", label: "Centre", values: series.map((p) => p.centre_mm3) },
+                  { key: "capbon", label: "Cap Bon", values: series.map((p) => p.cap_bon_mm3), color: "#a9762f" },
+                ]}
+              />
+            </DataState>
+          </Panel>
+        </div>
+      </DataState>
+
+      <AssessmentPanel
+        region={region}
+        crops={crops}
+        period={period}
+        userRole={userRole}
+        governorates={governorates}
+        setRegion={setRegion}
+      />
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Assessment panel (Overview + Regions)
+// ---------------------------------------------------------------------------
+function AssessmentPanel({
+  region,
+  crops,
+  period,
+  userRole,
+  governorates,
+  setRegion,
+}: {
+  region: string;
+  crops: string[];
+  period: string;
+  userRole: UserRole;
+  governorates: string[];
+  setRegion: (value: string) => void;
+}) {
+  const [crop, setCrop] = useState("");
+  const { data, error, loading, reload } = useAssessment(region, crop || null, period);
+  const [audit, setAudit] = useState(false);
+
+  return (
+    <Panel
+      className="chart-panel"
+      title={`Risk assessment — ${region}`}
+      subtitle={
+        <>
+          Profile <strong>{userRole}</strong>
+          {crop ? (
+            <>
+              {" · "}crop <strong>{crop}</strong>
+            </>
+          ) : null}
+          {" · "}
+          {data ? `${data.risk.level_label} (${data.risk.category})` : "awaiting run"}
+        </>
+      }
+      actions={
+        <>
+          <GovernorateField value={region} options={governorates} onChange={setRegion} />
+          <Select label="Crop" id="crop" value={crop} options={["", ...crops]} onChange={setCrop} />
+          <Button variant="primary" onClick={reload} disabled={loading}>
+            {loading ? <span className="spinner" /> : <Icon name="sparkles" size={14} />}
+            {loading ? "Assessing…" : "Run assessment"}
+          </Button>
+        </>
+      }
+    >
+      <DataState loading={loading && !data} error={error} idle={!data && !loading && !error}>
+        {data ? (
+          <>
+            <div className="assessment-head">
+              <RiskPill tone={riskTone(data.risk.level_code)}>{data.risk.level_label}</RiskPill>
+              <p>{data.risk.recommended_action}</p>
+            </div>
+
+            <div className="analysis-sections">
+              <div className="analysis-block">
+                <h3 className="block-title">Model drivers</h3>
+                {data.risk.drivers.map((driver) => (
+                  <div className="comparison-row" key={driver.indicator}>
+                    <span>{driver.indicator}</span>
+                    <strong>{driver.value}</strong>
+                    <small>{driver.signal}</small>
+                  </div>
+                ))}
+                <SourceNote>{data.risk.source}</SourceNote>
+              </div>
+
+              <div className="analysis-block">
+                <h3 className="block-title">Climate indicators</h3>
+                <div className="comparison-bar">
+                  <span>Precipitation 12m</span>
+                  <strong>{num(data.rainfall.precipitation_mm, 1)} mm</strong>
+                  <div>
+                    <i
+                      style={{
+                        width: `${ratio(data.rainfall.precipitation_mm, data.rainfall.precipitation_previous_mm) * 100}%`,
+                      }}
+                    />
+                  </div>
+                  <small>previous {num(data.rainfall.precipitation_previous_mm, 1)} mm</small>
+                </div>
+                <div className="comparison-bar">
+                  <span>Soil moisture</span>
+                  <strong>{num(data.rainfall.mean_soil_moisture_0_7cm, 3)}</strong>
+                  <div>
+                    <i style={{ width: `${ratio(data.rainfall.mean_soil_moisture_0_7cm, data.rainfall.soil_moisture_previous) * 100}%` }} />
+                  </div>
+                  <small>m³/m³, 0–7 cm</small>
+                </div>
+                <div className="comparison-bar">
+                  <span>Reference ET₀</span>
+                  <strong>{num(data.rainfall.et0_total_mm, 1)} mm</strong>
+                  <div>
+                    <i style={{ width: `${ratio(data.rainfall.et0_total_mm, data.rainfall.et0_previous_mm) * 100}%` }} />
+                  </div>
+                  <small>previous {num(data.rainfall.et0_previous_mm, 1)} mm</small>
+                </div>
+                <SourceNote>
+                  {data.rainfall.period_label} · {data.rainfall.coverage_days} days ·{" "}
+                  {data.rainfall.source}
+                </SourceNote>
+              </div>
+
+              <div className="analysis-block">
+                <h3 className="block-title">Reservoir position</h3>
+                {data.water ? (
+                  <>
+                    <div className="comparison-row">
+                      <span>Reference dam</span>
+                      <strong>{data.water.worst_dam_name}</strong>
+                      <small>{data.water.selection_note}</small>
+                    </div>
+                    <div className="comparison-row">
+                      <span>Dam fill</span>
+                      <strong>{num(data.water.dam_fill_rate_pct, 1)}%</strong>
+                      <small>status: {data.water.fill_status}</small>
+                      <div>
+                        <i style={{ width: `${data.water.dam_fill_rate_pct}%` }} />
+                      </div>
+                    </div>
+                    <div className="comparison-row">
+                      <span>National stock</span>
+                      <strong>{num(data.water.national_stock_mm3, 1)} Mm³</strong>
+                      <small>
+                        {signedPct(data.water.stock_vs_3yr_avg_pct)} vs 3yr ·{" "}
+                        {signedPct(data.water.stock_vs_last_year_pct)} vs last year
+                      </small>
+                    </div>
+                    <div className="comparison-row">
+                      <span>Seasonal inflow</span>
+                      <strong>{signedPct(data.water.seasonal_inflow_change_pct)}</strong>
+                      <small>vs previous season</small>
+                    </div>
+                  </>
+                ) : (
+                  <p className="hint">{data.water_note ?? "No dam data for this governorate."}</p>
+                )}
+                <SourceNote>{data.water?.source ?? data.sources.join(" · ")}</SourceNote>
+              </div>
+            </div>
+
+            {data.crop_exposure ? (
+              <>
+                <h3 className="block-title wide">{data.crop_exposure.crop} exposure — {data.crop_exposure.exposure_score}/100</h3>
+                <div className="factor-list">
+                  {data.crop_exposure.factors.map((factor) => (
+                    <div className="factor-row" key={factor.factor}>
+                      <span className="factor-name">{factor.factor}</span>
+                      <span className="factor-value">{factor.value}</span>
+                      <Bar value={factor.stress_score} tone={factor.stress_score > 60 ? "danger" : "olive"} />
+                      <span className="factor-meta">
+                        stress {factor.stress_score} · weight {factor.weight}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+                <SourceNote>
+                  {data.crop_exposure.method} {data.crop_exposure.note}
+                  {data.crop_exposure.unavailable_factors.length
+                    ? ` Unavailable factors: ${data.crop_exposure.unavailable_factors.join(", ")}.`
+                    : ""}
+                </SourceNote>
+              </>
+            ) : null}
+
+            <div className="panel-footer">
+              <Button variant="ghost" onClick={() => setAudit((value) => !value)}>
+                {audit ? "Hide" : "Show"} technical audit log
+              </Button>
+              <SourceNote>
+                Sources: {data.sources.join(" · ")} · data through {formatDate(data.data_through)}
+              </SourceNote>
+            </div>
+            {audit ? <pre className="raw-json">{JSON.stringify(data, null, 2)}</pre> : null}
+          </>
+        ) : null}
+      </DataState>
+    </Panel>
+  );
+}
+
+/** Bar width relative to the previous window, clamped to 0–100 %. */
+function ratio(current: number | null, previous: number | null): number {
+  if (current == null) return 0;
+  if (!previous) return Math.min(100, Math.max(4, current));
+  return Math.min(100, Math.max(3, (current / previous) * 100));
+}
+
+/** Plain-text brief shared by the Overview export and the Reports page. */
+function buildBrief(
+  data: Assessment,
+  userRole: UserRole,
+  crop: string,
+  period: string,
+  latest: { date: string; national_stock_mm3: number | null } | null,
+): string {
+  const lines = [
+    "AGRIRISK — TUNISIA AGRICULTURAL RISK BRIEF",
+    "=".repeat(52),
+    `Governorate : ${data.governorate}`,
+    `Profile     : ${userRole}`,
+    `Crop focus  : ${crop || "General agriculture"}`,
+    `Period      : ${data.period_label} (${period})`,
+    `Generated   : ${new Date().toISOString()}`,
+    "",
+    "CLIMATE (Open-Meteo, measured)",
+    `- Precipitation (12m)     : ${num(data.rainfall.precipitation_mm, 1)} mm`,
+    `- Previous 12m            : ${num(data.rainfall.precipitation_previous_mm, 1)} mm`,
+    `- Rainfall anomaly        : ${signedPct(data.rainfall.rainfall_anomaly_pct)}`,
+    `- Mean topsoil moisture   : ${num(data.rainfall.mean_soil_moisture_0_7cm, 3)} m³/m³`,
+    `- Reference ET₀           : ${num(data.rainfall.et0_total_mm, 1)} mm`,
+    "",
+    "WATER (AgriRisk dam dataset, measured)",
+  ];
+
+  if (data.water) {
+    lines.push(
+      `- Reference dam           : ${data.water.worst_dam_name} (${data.water.region ?? "n/a"})`,
+      `- Dam fill                : ${num(data.water.dam_fill_rate_pct, 1)}% — ${data.water.fill_status}`,
+      `- National stock          : ${num(data.water.national_stock_mm3, 1)} Mm³`,
+      `- vs three-year average   : ${signedPct(data.water.stock_vs_3yr_avg_pct)}`,
+      `- vs last year            : ${signedPct(data.water.stock_vs_last_year_pct)}`,
+      `- Seasonal inflow change  : ${signedPct(data.water.seasonal_inflow_change_pct)}`,
+    );
+  } else {
+    lines.push(`- ${data.water_note ?? "No dam data for this governorate."}`);
+  }
+
+  lines.push("", `RISK MODEL — ${data.risk.level_label} (${data.risk.category})`, `- Action: ${data.risk.recommended_action}`, "", "Drivers");
+  for (const driver of data.risk.drivers) lines.push(`- ${driver.indicator}: ${driver.value} — ${driver.signal}`);
+
+  if (data.crop_exposure) {
+    lines.push(
+      "",
+      `CROP EXPOSURE — ${data.crop_exposure.crop}: ${data.crop_exposure.exposure_level} (${data.crop_exposure.exposure_score}/100)`,
+      ...data.crop_exposure.factors.map(
+        (factor) => `- ${factor.factor}: ${factor.value} (stress ${factor.stress_score}, weight ${factor.weight})`,
+      ),
+    );
+  }
+
+  lines.push("", "Sources", ...data.sources.map((source) => `- ${source}`), "", data.note);
+  if (latest) lines.push(`National stock series through ${latest.date}: ${num(latest.national_stock_mm3, 1)} Mm³.`);
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Regions
+// ---------------------------------------------------------------------------
+function RegionsPage({
+  period,
+  region,
+  setRegion,
+  governorates,
+  crops,
+  userRole,
+}: {
+  period: string;
+  region: string;
+  setRegion: (value: string) => void;
+  governorates: string[];
+  crops: string[];
+  userRole: UserRole;
+}) {
+  const national = useNational(period);
+  const points = useMemo(() => national.data?.points ?? [], [national.data]);
+  const sorted = useMemo(
+    () =>
+      [...points].sort(
+        (a, b) =>
+          (LEVEL_RANK[a.risk_level ?? "LOW"] ?? 9) - (LEVEL_RANK[b.risk_level ?? "LOW"] ?? 9) ||
+          (a.rainfall_anomaly_pct ?? 0) - (b.rainfall_anomaly_pct ?? 0),
+      ),
+    [points],
+  );
+  const current = points.find((point) => point.name === region);
+
+  const exportCsv = () => {
+    if (!sorted.length) return;
+    downloadText(
+      `AgriRisk_regions_${period}.csv`,
+      toCsv(
+        ["governorate", "risk_level", "risk_label", "precipitation_mm", "rainfall_anomaly_pct", "soil_moisture_0_7cm", "et0_total_mm", "dam_fill_pct", "dam"],
+        sorted.map((point) => [
+          point.name,
+          point.risk_level,
+          point.risk_label,
+          point.precipitation_mm,
+          point.rainfall_anomaly_pct,
+          point.mean_soil_moisture_0_7cm,
+          point.et0_total_mm,
+          point.dam_fill_rate_pct,
+          point.worst_dam_name,
+        ]),
+      ),
+      "text/csv",
+    );
   };
 
   return (
     <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">NATIONAL OVERVIEW · Q4 2024</div>
-          <div className="page-title">Tunisia Agricultural Risk</div>
-        </div>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <RoleSwitcher userRole={userRole} setUserRole={setUserRole} />
-          <Action onClick={downloadBrief}>
-            <Icon name="download" size={15} /> Export brief
-          </Action>
-        </div>
-      </div>
+      <PageIntro
+        eyebrow="Regional analysis"
+        title={region}
+        description="Every governorate is assessed on the same measured indicators, so regions can be compared directly. Click any row to change the selected region."
+        actions={
+          <>
+            <GovernorateField value={region} options={governorates} onChange={setRegion} />
+            <Button onClick={exportCsv} disabled={!sorted.length}>
+              <Icon name="download" size={14} /> Export CSV
+            </Button>
+          </>
+        }
+      />
 
-      <div className="executive-summary">
-        <span>Executive view</span>
+      <div className="region-hero">
+        <div className="region-title-line">
+          <h2 className="section-title">{region}</h2>
+          <RiskPill tone={toneForLevel(current?.risk_level)}>{current?.risk_label ?? "No data"}</RiskPill>
+          {current?.risk_category ? <small className="muted">{current.risk_category}</small> : null}
+        </div>
         <p>
-          Water availability remains materially below seasonal norms. Exposure is concentrated across central governorates, 
-          while northern reservoir conditions provide limited near-term resilience.
+          {current
+            ? `${region} is classified ${current.risk_label?.toLowerCase()} risk${
+                current.risk_category ? ` (${current.risk_category.toLowerCase()})` : ""
+              } for the selected period. It received ${num(current.precipitation_mm, 1)} mm of precipitation, ${signedPct(
+                current.rainfall_anomaly_pct,
+              )} against the previous 12 months, with mean topsoil moisture of ${num(
+                current.mean_soil_moisture_0_7cm,
+                3,
+              )} m³/m³ and reference ET₀ of ${num(current.et0_total_mm, 1)} mm.`
+            : "No climate record was returned for this governorate."}
         </p>
-        <small>Updated 06 Jan 2025 · 08:40</small>
+        {current ? (
+          <p className="muted">
+            {current.dam_fill_rate_pct == null
+              ? "No monitored reservoir: this region is assessed on climate indicators only."
+              : `Reference reservoir ${current.worst_dam_name} (${current.region ?? "n/a"}) is at ${num(
+                  current.dam_fill_rate_pct,
+                  1,
+                )}% fill — ${current.fill_status ?? "status unknown"}.`}{" "}
+            Run the assessment below for the model drivers and recommended action.
+          </p>
+        ) : null}
       </div>
 
-      <Indicators />
+      <AssessmentPanel
+        region={region}
+        crops={crops}
+        period={period}
+        userRole={userRole}
+        governorates={governorates}
+        setRegion={setRegion}
+      />
 
-      {/* AI Risk Assessment Generator & Crop Choice Section */}
-      <section style={{ marginBottom: 36 }}>
-        <div style={{ border: "1px solid var(--border-strong)", borderRadius: "var(--radius)", padding: 22, background: "var(--surface-raised)", boxShadow: "0 10px 28px var(--shadow)" }}>
-          <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
-            <div>
-              <div className="section-label">Climate Risk Assessment Tools ({selectedRegion})</div>
-              <div style={{ fontSize: 18, fontWeight: 650, color: "var(--navy)" }}>
-                Risk Assessment Assistant · {userRole}
-              </div>
-              <p style={{ color: "var(--secondary)", margin: "4px 0 0", fontSize: 12 }}>
-                Agro-meteorological risk evaluation and crop exposure analysis for <strong>{selectedRegion}</strong>.
-              </p>
-            </div>
+      <Panel
+        className="editorial-table"
+        title={`All governorates (${sorted.length})`}
+        subtitle="Sorted by model risk, then rainfall anomaly"
+      >
+        <div className="data-row table-head cols-6">
+          <span>Governorate</span>
+          <span>Risk</span>
+          <span>Precipitation</span>
+          <span>Anomaly</span>
+          <span>Dam fill</span>
+          <span>Reference dam</span>
+        </div>
+        <DataState loading={national.loading} error={national.error} empty={!sorted.length}>
+          {sorted.map((point) => (
             <button
-              className="role-btn active"
-              onClick={handleRunAnalysis}
-              disabled={loading}
-              style={{ padding: "10px 20px", fontSize: 12 }}
+              type="button"
+              key={point.name}
+              className={`data-row row-button${point.name === region ? " is-selected" : ""}`}
+              onClick={() => setRegion(point.name)}
             >
-              {loading ? <span className="spinner" /> : <Icon name="sparkles" size={16} />}
-              {loading ? "Retrieving data..." : `Run Risk Assessment (${selectedRegion})`}
+              <strong>{point.name}</strong>
+              <span>
+                <RiskPill tone={toneForLevel(point.risk_level)}>{point.risk_label}</RiskPill>
+              </span>
+              <span>{num(point.precipitation_mm, 1)} mm</span>
+              <span className="mono">{signedPct(point.rainfall_anomaly_pct)}</span>
+              <span>{pct(point.dam_fill_rate_pct)}</span>
+              <span className="muted">{point.worst_dam_name ?? "—"}</span>
             </button>
+          ))}
+        </DataState>
+        {national.data?.failures?.length ? (
+          <SourceNote>
+            {national.data.failures.length} governorate(s) failed to load:{" "}
+            {national.data.failures.map((failure) => failure.governorate).join(", ")}.
+          </SourceNote>
+        ) : null}
+      </Panel>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Water
+// ---------------------------------------------------------------------------
+function WaterPage() {
+  const summary = useWaterSummary();
+  const history = useWaterHistory(36);
+  const [dam, setDam] = useState<string | null>(null);
+  const damHistory = useDamHistory(dam);
+  const series = history.data?.series ?? [];
+  const latest = series[series.length - 1] ?? null;
+  const rows = useMemo(
+    () =>
+      [...(summary.data?.rows ?? [])].sort(
+        (a, b) => (a.fill_pct ?? 999) - (b.fill_pct ?? 999) || a.dam.localeCompare(b.dam),
+      ),
+    [summary.data],
+  );
+  const critical = rows.filter((row) => (row.fill_pct ?? 100) < 30).length;
+  const dates = series.map((point) => point.date);
+
+  const exportCsv = () => {
+    if (!rows.length) return;
+    downloadText(
+      `AgriRisk_dams_${summary.data?.date ?? "latest"}.csv`,
+      toCsv(
+        ["dam", "governorate", "zone", "capacity_mm3", "stock_mm3", "fill_pct", "inflow_mm3", "previous_inflow_mm3", "inflow_change_pct"],
+        rows.map((row) => [
+          row.dam,
+          row.governorate,
+          row.region,
+          row.capacity_mm3,
+          row.stock_mm3,
+          row.fill_pct,
+          row.current_season_inflow_mm3,
+          row.previous_season_inflow_mm3,
+          row.inflow_change_pct,
+        ]),
+      ),
+      "text/csv",
+    );
+  };
+
+  return (
+    <>
+      <PageIntro
+        eyebrow="Water resources"
+        title="Reservoir monitoring"
+        description={`Measured stock and fill for ${summary.data?.count ?? 0} monitored dams, updated ${formatDate(summary.data?.date)}.`}
+        actions={
+          <>
+            <Button onClick={() => { summary.reload(); history.reload(); }}>
+              <Icon name="refresh" size={14} /> Refresh
+            </Button>
+            <Button onClick={exportCsv} disabled={!rows.length}>
+              <Icon name="download" size={14} /> Export CSV
+            </Button>
+          </>
+        }
+      />
+
+      <DataState loading={history.loading} error={history.error} empty={!series.length}>
+        <section className="zone-strip">
+          <div>
+            <span>North zone</span>
+            <strong>{num(latest?.north_mm3, 1)} Mm³</strong>
+            <small>Northern dams — Siliana, Badr, Sidi Salem</small>
+          </div>
+          <div>
+            <span>Centre zone</span>
+            <strong>{num(latest?.centre_mm3, 1)} Mm³</strong>
+            <small>Central dams — Sidi Salem, Kasserine, El Kef</small>
+          </div>
+          <div>
+            <span>Cap Bon zone</span>
+            <strong>{num(latest?.cap_bon_mm3, 1)} Mm³</strong>
+            <small>Eastern dams — Sfax, El Gonnaatine, Sidi Abdelaziz</small>
+          </div>
+        </section>
+      </DataState>
+
+      <div className="chart-grid">
+        <Panel
+          className="chart-panel"
+          title="National stock vs three-year average"
+          subtitle="Measured monthly totals, 36 months"
+          actions={
+            latest ? (
+              <div className="chart-stat">
+                <strong>{num(latest.national_stock_mm3, 1)} Mm³</strong>
+                <span>
+                  {latest.three_year_average_mm3
+                    ? signedPct((latest.national_stock_mm3! / latest.three_year_average_mm3 - 1) * 100)
+                    : ""}
+                </span>
+              </div>
+            ) : null
+          }
+        >
+          <DataState loading={history.loading} error={history.error} empty={!series.length}>
+            <LineChart
+              dates={dates}
+              unit="Mm³"
+              valueSuffix=" Mm³"
+              series={[
+                { key: "stock", label: "National stock", values: series.map((p) => p.national_stock_mm3) },
+                { key: "avg", label: "Three-year average", values: series.map((p) => p.three_year_average_mm3), dashed: true },
+                { key: "last", label: "Same month last year", values: series.map((p) => p.last_year_stock_mm3), color: "var(--sage)" },
+              ]}
+            />
+          </DataState>
+        </Panel>
+
+        <Panel className="chart-panel" title="Seasonal inflow" subtitle="Current vs previous season, measured">
+          <DataState loading={history.loading} error={history.error} empty={!series.length}>
+            <LineChart
+              dates={dates}
+              unit="Mm³"
+              valueSuffix=" Mm³"
+              zeroBased={false}
+              series={[
+                { key: "inflow", label: "Current season", values: series.map((p) => p.current_season_inflow_mm3) },
+                { key: "prev", label: "Previous season", values: series.map((p) => p.previous_season_inflow_mm3), color: "var(--sage)" },
+              ]}
+            />
+          </DataState>
+        </Panel>
+      </div>
+
+      <Panel
+        className="editorial-table"
+        title={`Monitored dams (${rows.length})`}
+        subtitle="Lowest fill first"
+        legend={
+          <>
+            <span>
+              <i className="swatch tone-high" />
+              Below 30% fill
+            </span>
+            <span>
+              <i className="swatch tone-moderate" />
+              30–45%
+            </span>
+            <span>
+              <i className="swatch tone-low" />
+              Above 45%
+            </span>
+          </>
+        }
+      >
+        <div className="data-row table-head cols-6">
+          <span>Dam</span>
+          <span>Governorate</span>
+          <span>Capacity</span>
+          <span>Stock</span>
+          <span>Fill</span>
+          <span>Inflow change</span>
+        </div>
+        <DataState loading={summary.loading} error={summary.error} empty={!rows.length}>
+          {rows.map((row) => (
+            <button
+              type="button"
+              key={row.dam}
+              className={`data-row cols-6 row-button${row.dam === dam ? " is-selected" : ""}`}
+              onClick={() => setDam(row.dam === dam ? null : row.dam)}
+              title={`Show measured history for ${row.dam}`}
+            >
+              <strong>
+                {row.dam}
+                <small className="muted"> {row.region}</small>
+              </strong>
+              <span>{row.governorate}</span>
+              <span>{num(row.capacity_mm3, 1)} Mm³</span>
+              <span>{num(row.stock_mm3, 1)} Mm³</span>
+              <span className={(row.fill_pct ?? 100) < 30 ? "warning" : undefined}>
+                {pct(row.fill_pct)}
+              </span>
+              <span className="mono">{signedPct(row.inflow_change_pct)}</span>
+            </button>
+          ))}
+        </DataState>
+        {rows.length ? (
+          <div className="watch-note">
+            <span>Interpretation</span>
+            <p>
+              {critical} of {rows.length} monitored dams are below 30% of capacity. Reservoir data is measured
+              monthly from the AgriRisk dam dataset ({summary.data?.source ?? "unknown source"}) and is not
+              interpolated for the current month.
+            </p>
+          </div>
+        ) : null}
+      </Panel>
+
+      {dam ? (
+        <Panel
+          className="chart-panel"
+          title={`${dam} — measured history`}
+          subtitle={`${damHistory.data?.governorate ?? ""} · last ${damHistory.data?.series.length ?? 0} readings`}
+          actions={
+            <Button variant="ghost" onClick={() => setDam(null)}>
+              <Icon name="x" size={13} /> Clear
+            </Button>
+          }
+        >
+          <DataState loading={damHistory.loading} error={damHistory.error} empty={!damHistory.data?.series.length}>
+            {damHistory.data ? (
+              <LineChart
+                dates={damHistory.data.series.map((point) => point.date)}
+                unit="% fill"
+                valueSuffix="% fill"
+                zeroBased={false}
+                series={[
+                  { key: "fill", label: "Fill rate", values: damHistory.data.series.map((p) => p.fill_pct) },
+                  {
+                    key: "stock",
+                    label: "Stock (Mm³)",
+                    values: damHistory.data.series.map((p) => p.stock_mm3),
+                    color: "var(--sage)",
+                  },
+                ]}
+              />
+            ) : null}
+          </DataState>
+          <SourceNote>Readings come from the AgriRisk dam dataset and are not interpolated.</SourceNote>
+        </Panel>
+      ) : null}
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Climate
+// ---------------------------------------------------------------------------
+function ClimatePage({ period }: { period: string }) {
+  const climate = useClimate(period);
+  const rows = useMemo(
+    () =>
+      [...(climate.data?.rows ?? [])].sort(
+        (a, b) => (a.rainfall_anomaly_pct ?? 0) - (b.rainfall_anomaly_pct ?? 0),
+      ),
+    [climate.data],
+  );
+  const stats = useMemo(
+    () => ({
+      precipitation: mean(rows.map((row) => row.precipitation_mm)),
+      anomaly: mean(rows.map((row) => row.rainfall_anomaly_pct)),
+      soil: mean(rows.map((row) => row.mean_soil_moisture_0_7cm)),
+      et0: mean(rows.map((row) => row.et0_total_mm)),
+    }),
+    [rows],
+  );
+  const driest = rows.slice(0, 10);
+  const wettest = [...rows].reverse().slice(0, 5);
+  const maxAnomaly = Math.max(...rows.map((row) => Math.abs(row.rainfall_anomaly_pct ?? 0)), 1);
+
+  return (
+    <>
+      <PageIntro
+        eyebrow="Climate"
+        title="Measured climate indicators"
+        description="Open-Meteo ERA5 archive data aggregated per governorate over the selected window and compared with the preceding window of equal length."
+        actions={
+          <Button onClick={climate.reload}>
+            <Icon name="refresh" size={14} /> Refresh
+          </Button>
+        }
+      />
+
+      <DataState loading={climate.loading} error={climate.error}>
+        <section className="indicator-strip">
+          <Stat label="Mean precipitation" value={num(stats.precipitation, 1)} unit="mm" context="across assessed governorates" />
+          <Stat
+            label="Mean anomaly"
+            value={num(stats.anomaly, 1)}
+            unit="%"
+            context="vs previous window of equal length"
+          />
+          <Stat label="Mean soil moisture" value={num(stats.soil, 3)} unit="m³/m³" context="0–7 cm depth" />
+          <Stat label="Mean reference ET₀" value={num(stats.et0, 1)} unit="mm" context="Makkink-style reference" />
+          <Stat
+            label="Governorates"
+            value={int(rows.length)}
+            context={climate.data?.failures?.length ? `${climate.data.failures.length} failed` : "all loaded"}
+            emphasis
+          />
+        </section>
+
+        <div className="analysis-sections">
+          <div className="analysis-block">
+            <h3 className="block-title">Driest anomalies</h3>
+            {driest.map((row) => (
+              <div className="comparison-bar" key={row.governorate}>
+                <span>{row.governorate}</span>
+                <strong>{signedPct(row.rainfall_anomaly_pct)}</strong>
+                <div>
+                  <i
+                    style={{
+                      width: `${(Math.abs(row.rainfall_anomaly_pct ?? 0) / maxAnomaly) * 100}%`,
+                      background: (row.rainfall_anomaly_pct ?? 0) < -15 ? "var(--danger)" : "var(--warning)",
+                    }}
+                  />
+                </div>
+                <small>{num(row.precipitation_mm, 1)} mm</small>
+              </div>
+            ))}
           </div>
 
-          {/* Crop Selection Bar */}
-          <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid var(--border)", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: "var(--muted)", textTransform: "uppercase", letterSpacing: "0.5px" }}>
-              Target Crop Profile:
-            </span>
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {cropList.map((crop) => (
+          <div className="analysis-block">
+            <h3 className="block-title">Wettest anomalies</h3>
+            {wettest.map((row) => (
+              <div className="comparison-bar" key={row.governorate}>
+                <span>{row.governorate}</span>
+                <strong>{signedPct(row.rainfall_anomaly_pct)}</strong>
+                <div>
+                  <i style={{ width: `${(Math.abs(row.rainfall_anomaly_pct ?? 0) / maxAnomaly) * 100}%`, background: "var(--sage)" }} />
+                </div>
+                <small>{num(row.precipitation_mm, 1)} mm</small>
+              </div>
+            ))}
+          </div>
+
+          <div className="analysis-block">
+            <h3 className="block-title">Method</h3>
+            <div className="comparison-row">
+              <span>Source</span>
+              <strong>{climate.data?.source ?? "—"}</strong>
+              <small>Daily precipitation, topsoil moisture and reference evapotranspiration.</small>
+            </div>
+            <div className="comparison-row">
+              <span>Window</span>
+              <strong>{rows[0]?.period_label ?? "—"}</strong>
+              <small>Each governorate is queried at its own centroid coordinates.</small>
+            </div>
+            <div className="comparison-row">
+              <span>Comparison</span>
+              <strong>Previous window</strong>
+              <small>Anomaly is computed as the change against the immediately preceding window of equal length.</small>
+            </div>
+            <div className="comparison-row">
+              <span>Coverage</span>
+              <strong>{int(rows.filter((row) => row.precipitation_mm != null).length)}/{rows.length}</strong>
+              <small>Governorates with usable precipitation totals for this window.</small>
+            </div>
+            {climate.data?.failures?.length ? (
+              <SourceNote>
+                Failed: {climate.data.failures.map((failure) => `${failure.governorate} (${failure.error})`).join("; ")}
+              </SourceNote>
+            ) : null}
+          </div>
+        </div>
+      </DataState>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Crops
+// ---------------------------------------------------------------------------
+function CropsPage({
+  region,
+  setRegion,
+  governorates,
+}: {
+  region: string;
+  setRegion: (value: string) => void;
+  governorates: string[];
+}) {
+  const profiles = useCropProfiles();
+  const exposure = useCropExposure(region);
+  const [crop, setCrop] = useState("");
+  const assessment = useAssessment(region, crop || null);
+  const cropList = profiles.data?.crops ?? [];
+  const detail = assessment.data?.crop_exposure ?? null;
+  const rows = exposure.data?.rows ?? [];
+  const ranked = useMemo(() => [...rows].sort((a, b) => b.exposure_score - a.exposure_score), [rows]);
+
+  return (
+    <>
+      <PageIntro
+        eyebrow="Crop exposure"
+        title={`Crop sensitivity — ${region}`}
+        description="Exposure scores combine each crop's water requirement and drought sensitivity with the measured climate and reservoir position of the selected governorate."
+        actions={<GovernorateField value={region} options={governorates} onChange={setRegion} />}
+      />
+
+      <div className="crop-section-container">
+        <div className="crop-section-header">
+          <h3>Crop profiles</h3>
+          <small className="muted">{cropList.length} crops · select one for a full factor breakdown</small>
+        </div>
+        <DataState loading={profiles.loading} error={profiles.error} empty={!cropList.length}>
+          <div className="crop-grid">
+            {cropList.map((profile) => (
+              <button
+                type="button"
+                key={profile.crop}
+                className={`crop-card${profile.crop === crop ? " selected" : ""}`}
+                onClick={() => setCrop(profile.crop === crop ? "" : profile.crop)}
+                aria-pressed={profile.crop === crop}
+              >
+                <strong>{profile.crop}</strong>
+                <span>{int(profile.water_need_mm)} mm water need</span>
+                <span>sensitivity {profile.drought_sensitivity}/5</span>
+                <span>{profile.season}</span>
+              </button>
+            ))}
+          </div>
+        </DataState>
+      </div>
+
+      {crop ? (
+        <Panel
+          className="chart-panel"
+          title={`${crop} exposure in ${region}`}
+          subtitle={detail ? `${detail.exposure_level} — ${detail.exposure_score}/100` : "loading factor breakdown"}
+        >
+          <DataState loading={assessment.loading && !detail} error={assessment.error} idle={!detail && !assessment.loading}>
+            {detail ? (
+              <>
+                <div className="analysis-sections">
+                  <div className="analysis-block">
+                    <h3 className="block-title">Profile</h3>
+                    <div className="comparison-row">
+                      <span>Water requirement</span>
+                      <strong>{int(detail.profile.water_need_mm)} mm</strong>
+                      <small>{detail.profile.season} season</small>
+                    </div>
+                    <div className="comparison-row">
+                      <span>Drought sensitivity</span>
+                      <strong>{detail.profile.drought_sensitivity}/5</strong>
+                      <small>{detail.profile.peak_water_demand}</small>
+                    </div>
+                    <div className="comparison-row">
+                      <span>Exposure</span>
+                      <strong>{detail.exposure_score}/100</strong>
+                      <small>{detail.exposure_level}</small>
+                      <div>
+                        <i style={{ width: `${detail.exposure_score}%` }} />
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="analysis-block">
+                    <h3 className="block-title">Measured conditions</h3>
+                    <div className="comparison-row">
+                      <span>Precipitation</span>
+                      <strong>{num(exposure.data?.climate.precipitation_mm, 1)} mm</strong>
+                      <small>{signedPct(exposure.data?.climate.rainfall_anomaly_pct)} vs previous window</small>
+                    </div>
+                    <div className="comparison-row">
+                      <span>Soil moisture</span>
+                      <strong>{num(exposure.data?.climate.mean_soil_moisture_0_7cm, 3)}</strong>
+                      <small>m³/m³, 0–7 cm</small>
+                    </div>
+                    <div className="comparison-row">
+                      <span>Dam fill</span>
+                      <strong>{pct(exposure.data?.climate.dam_fill_rate_pct)}</strong>
+                      <small>{exposure.data?.climate.dam_fill_rate_pct == null ? "no monitored dam" : "reference reservoir"}</small>
+                    </div>
+                  </div>
+
+                  <div className="analysis-block">
+                    <h3 className="block-title">Exposure factors</h3>
+                    {detail.factors.map((factor) => (
+                      <div className="comparison-bar" key={factor.factor}>
+                        <span>{factor.factor}</span>
+                        <strong>{factor.value}</strong>
+                        <div>
+                          <i
+                            style={{
+                              width: `${Math.min(100, factor.stress_score)}%`,
+                              background: factor.stress_score > 60 ? "var(--danger)" : "var(--olive)",
+                            }}
+                          />
+                        </div>
+                        <small>stress {factor.stress_score} · w {factor.weight}</small>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+                <SourceNote>
+                  {detail.method} {detail.note} {detail.profile.profile_note}
+                </SourceNote>
+              </>
+            ) : null}
+          </DataState>
+        </Panel>
+      ) : null}
+
+      <Panel
+        className="editorial-table"
+        title={`All crop exposure in ${region}`}
+        subtitle="Highest exposure first"
+      >
+        <div className="data-row table-head cols-4">
+          <span>Crop</span>
+          <span>Exposure</span>
+          <span>Score</span>
+          <span>Water need</span>
+        </div>
+        <DataState loading={exposure.loading} error={exposure.error} empty={!ranked.length}>
+          {ranked.map((row) => (
+            <button
+              type="button"
+              key={row.crop}
+              className={`data-row row-button${row.crop === crop ? " is-selected" : ""}`}
+              onClick={() => setCrop(row.crop)}
+            >
+              <strong>{row.crop}</strong>
+              <span>
+                <RiskPill tone={exposureTone(row.exposure_level)}>{row.exposure_level}</RiskPill>
+              </span>
+              <span>
+                <Bar value={row.exposure_score} tone={row.exposure_level === "HIGH" ? "danger" : "olive"} />{" "}
+                {row.exposure_score}
+              </span>
+              <span>{int(row.water_need_mm)} mm</span>
+            </button>
+          ))}
+        </DataState>
+      </Panel>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Scenarios
+// ---------------------------------------------------------------------------
+const SCENARIO_PRESETS = [-30, -20, -10, 0, 10, 20, 30];
+
+function ScenariosPage({
+  region,
+  setRegion,
+  governorates,
+  crops,
+}: {
+  region: string;
+  setRegion: (value: string) => void;
+  governorates: string[];
+  crops: string[];
+}) {
+  const [crop, setCrop] = useState("");
+  const [change, setChange] = useState(-10);
+  const debouncedChange = useDebounced(change, 450);
+  const scenario = useScenario(region, crop || null, debouncedChange);
+
+  const data = scenario.data;
+  const exposureShift =
+    data?.crop_exposure_before?.score != null && data.crop_exposure_after?.score != null
+      ? data.crop_exposure_after.score - data.crop_exposure_before.score
+      : null;
+
+  const exportScenario = () => {
+    if (!data) return;
+    downloadText(
+      `AgriRisk_scenario_${region.replace(/\s+/g, "_")}_${data.scenario.rainfall_change_pct}pct.json`,
+      JSON.stringify(data, null, 2),
+      "application/json",
+    );
+  };
+
+  return (
+    <>
+      <PageIntro
+        eyebrow="Scenario analysis"
+        title="Rainfall stress test"
+        description="Re-runs the AgriRisk model with a hypothetical change in 12-month precipitation. Soil moisture responds to the rainfall delta, so the model output moves without any fabricated data."
+        actions={
+          <>
+            <GovernorateField value={region} options={governorates} onChange={setRegion} />
+            <Select label="Crop" id="scenario-crop" value={crop} options={["", ...crops]} onChange={setCrop} />
+            <Button onClick={exportScenario} disabled={!data}>
+              <Icon name="download" size={14} /> Export JSON
+            </Button>
+          </>
+        }
+      />
+
+      <div className="scenario-layout">
+        <div className="scenario-controls">
+          <div className="control-row">
+            <div>
+              <span>Precipitation change</span>
+              <strong>{signed(change, 0)}%</strong>
+            </div>
+            <input
+              type="range"
+              min={-40}
+              max={40}
+              step={5}
+              value={change}
+              onChange={(event) => setChange(Number(event.target.value))}
+              aria-label="Precipitation change percentage"
+            />
+            <small>
+              <span>-40% severe drought</span>
+              <span>measured baseline</span>
+              <span>+40% wet year</span>
+            </small>
+          </div>
+
+          <div className="control-row">
+            <div>
+              <span>Quick scenarios</span>
+            </div>
+            <div className="chip-group">
+              {SCENARIO_PRESETS.map((preset) => (
                 <button
-                  key={crop}
-                  onClick={() => setSelectedCrop(crop)}
-                  style={{
-                    padding: "4px 10px",
-                    borderRadius: 4,
-                    border: `1px solid ${selectedCrop === crop ? "var(--accent)" : "var(--border)"}`,
-                    background: selectedCrop === crop ? "var(--accent-light)" : "var(--background)",
-                    color: selectedCrop === crop ? "var(--accent)" : "var(--foreground)",
-                    fontSize: 11,
-                    fontWeight: selectedCrop === crop ? 600 : 400,
-                    cursor: "pointer",
-                  }}
+                  key={preset}
+                  type="button"
+                  className={`chip${preset === change ? " is-active" : ""}`}
+                  onClick={() => setChange(preset)}
                 >
-                  {crop}
+                  {preset > 0 ? `+${preset}%` : `${preset}%`}
                 </button>
               ))}
             </div>
           </div>
 
-          {/* Active Crop Profile Metadata Card */}
-          {activeCropProfile && (
-            <div style={{ marginTop: 14, padding: "12px 16px", background: "var(--background)", borderRadius: 6, border: "1px dashed var(--border)", fontSize: 11, display: "flex", flexWrap: "wrap", gap: 18, alignItems: "center" }}>
-              <div>
-                <span style={{ color: "var(--muted)" }}>Annual Water Demand:</span>{" "}
-                <strong>{activeCropProfile.water_need_mm} mm/season</strong>
-              </div>
-              <div>
-                <span style={{ color: "var(--muted)" }}>Drought Sensitivity:</span>{" "}
-                <strong>{activeCropProfile.drought_sensitivity} / 5</strong>
-              </div>
-              <div>
-                <span style={{ color: "var(--muted)" }}>Peak Demand Window:</span>{" "}
-                <strong>{activeCropProfile.peak_water_demand}</strong>
-              </div>
-              <div>
-                <span style={{ color: "var(--muted)" }}>Production System:</span>{" "}
-                <strong>{activeCropProfile.production_system}</strong>
-              </div>
-            </div>
-          )}
-
-          {reportData && analysisResult && (
-            <div className="ai-report-container" style={{ marginTop: 20 }}>
-              <div className="ai-report-header">
-                <h3>{reportData.title}</h3>
-                <RiskPill>{analysisResult.risk}</RiskPill>
-              </div>
-              <div className="ai-report-content">{reportData.report}</div>
-              <div className="ai-metrics-row">
-                <div className="ai-metric-card">
-                  <span>Evaluated Risk Level</span>
-                  <strong>{analysisResult.risk}</strong>
-                </div>
-                <div className="ai-metric-card">
-                  <span>Confidence Index</span>
-                  <strong>{analysisResult.confidence}%</strong>
-                </div>
-                {selectedCrop !== "All Crops" && (
-                  <div className="ai-metric-card">
-                    <span>Selected Crop</span>
-                    <strong>{selectedCrop}</strong>
-                  </div>
-                )}
-              </div>
-              <div style={{ padding: "0 22px 18px" }}>
-                <button
-                  className="role-btn"
-                  onClick={() => setShowTechnical(!showTechnical)}
-                  style={{ fontSize: 11 }}
-                >
-                  {showTechnical ? "Hide" : "Show"} Technical Audit Log & Raw Data
-                </button>
-                {showTechnical && techJson && (
-                  <pre
-                    style={{
-                      background: "var(--background)",
-                      padding: 14,
-                      borderRadius: 6,
-                      marginTop: 10,
-                      fontSize: 11,
-                      overflowX: "auto",
-                    }}
-                  >
-                    {JSON.stringify(techJson, null, 2)}
-                  </pre>
-                )}
-              </div>
-            </div>
-          )}
-        </div>
-      </section>
-
-      <section className="overview-grid">
-        <div className="map-panel">
-          <div className="section-head">
+          <div className="control-row">
             <div>
-              <div className="section-title">Governorate risk</div>
-              <p>Composite water and climate exposure across 22 governorates</p>
+              <span>Model inputs</span>
             </div>
-            <div className="legend">
-              <span><i className="low"></i>Low</span>
-              <span><i className="medium"></i>Moderate</span>
-              <span><i className="high"></i>High</span>
+            <div className="comparison-row">
+              <span>Precipitation before</span>
+              <strong>{data ? `${num(data.scenario.precipitation_mm_before, 1)} mm` : "—"}</strong>
             </div>
-          </div>
-          <TunisiaMap selected={selectedRegion} setSelected={setSelectedRegion} />
-          <div className="selected-region">
-            <div>
-              <span>Selected region</span>
-              <strong>{selectedRegion}</strong>
+            <div className="comparison-row">
+              <span>Precipitation after</span>
+              <strong>{data ? `${num(data.scenario.precipitation_mm_after, 1)} mm` : "—"}</strong>
             </div>
-            <RiskPill>
-              {damInfo.per_dam_fill_pct < 30 ? "High" : damInfo.per_dam_fill_pct < 45 ? "Moderate" : "Low"}
-            </RiskPill>
-            <div>
-              <span>Risk probability</span>
-              <strong>{damInfo.per_dam_fill_pct < 30 ? "73%" : "52%"}</strong>
-            </div>
-            <div>
-              <span>Rainfall anomaly</span>
-              <strong>−21.3%</strong>
-            </div>
-            <Action className="text-action" onClick={onNavigateToRegions}>
-              Regional analysis <Icon name="arrow" size={14} />
-            </Action>
-          </div>
-        </div>
-
-        <div className="watchlist">
-          <div className="section-head">
-            <div>
-              <div className="section-title">Regional watchlist</div>
-              <p>Priority movements requiring review</p>
-            </div>
-            <Action className="text-action" onClick={onNavigateToRegions}>
-              All regions <Icon name="arrow" size={14} />
-            </Action>
-          </div>
-          <div className="data-table">
-            <div className="data-row table-head">
-              <span>Governorate</span>
-              <span>Risk</span>
-              <span>Water stress</span>
-              <span>Rainfall</span>
-              <span>Trend</span>
-            </div>
-            {watchlist.map((row) => (
-              <div
-                className="data-row"
-                key={row[0]}
-                onClick={() => setSelectedRegion(row[0])}
-                style={{ cursor: "pointer" }}
-              >
-                <strong>{row[0]}</strong>
-                <span><RiskPill>{row[1]}</RiskPill></span>
-                <span>{row[2]}</span>
-                <span className="mono">{row[3]}</span>
-                <span className={`trend ${row[4].toLowerCase()}`}>{row[4]}</span>
-              </div>
-            ))}
-          </div>
-          <div className="watch-note">
-            <span>Portfolio signal</span>
-            <p>Central Tunisia accounts for 62% of high-risk regional exposure this quarter.</p>
-          </div>
-        </div>
-      </section>
-
-      <section className="chart-grid">
-        <div className="chart-panel">
-          <div className="section-head">
-            <div>
-              <div className="section-title">Water availability</div>
-              <p>National stock against three-year average</p>
-            </div>
-            <div className="chart-stat">
-              <strong>1,250 Mm³</strong>
-              <span>−14.8%</span>
+            <div className="comparison-row">
+              <span>Soil moisture shift</span>
+              <strong>
+                {data ? signed(data.scenario.soil_moisture_after - data.scenario.soil_moisture_before, 3) : "—"}
+              </strong>
+              <small>m³/m³, 0–7 cm</small>
             </div>
           </div>
-          <LineChart />
-          <div className="axis">
-            <span>Jul</span><span>Aug</span><span>Sep</span><span>Oct</span><span>Nov</span><span>Dec</span>
-          </div>
-          <div className="chart-legend">
-            <span><i></i>Current stock</span>
-            <span><i></i>3-year average</span>
-          </div>
         </div>
 
-        <div className="chart-panel">
-          <div className="section-head">
-            <div>
-              <div className="section-title">Rainfall anomaly</div>
-              <p>Monthly variance from 30-year normal</p>
-            </div>
-            <div className="chart-stat">
-              <strong>−21.3%</strong>
-              <span>Below norm</span>
-            </div>
-          </div>
-          <LineChart type="rain" />
-          <div className="axis">
-            <span>Jul</span><span>Aug</span><span>Sep</span><span>Oct</span><span>Nov</span><span>Dec</span>
-          </div>
-          <div className="chart-legend">
-            <span><i></i>Observed</span>
-            <span><i></i>Historical norm</span>
-          </div>
-        </div>
-      </section>
-    </>
-  );
-}
-
-/**
- * Dedicated AI Risk Assistant Page
- */
-function AssistantPage({
-  userRole,
-  setUserRole,
-  selectedRegion,
-  setSelectedRegion,
-}: {
-  userRole: UserRole;
-  setUserRole: (r: UserRole) => void;
-  selectedRegion: string;
-  setSelectedRegion: (r: string) => void;
-}) {
-  const [selectedCrop, setSelectedCrop] = useState<string>("All Crops");
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      content: `Hello! I am your **AI Risk Analyst**. I provide decision-ready climate, reservoir, and crop exposure analysis across Tunisian governorates.\n\nHow can I assist your underwriting or agricultural planning today?`,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    },
-  ]);
-  const [input, setInput] = useState("");
-  const [sending, setSending] = useState(false);
-
-  const governorates = useMemo(() => Object.keys(TUNISIA_REGIONS), []);
-  const cropList = useMemo(() => ["All Crops", ...getCropList()], []);
-
-  const suggestedPrompts = [
-    `Why is the climate risk high in ${selectedRegion}?`,
-    `Which crops are most exposed to drought in ${selectedRegion}?`,
-    `What are the dam water storage indicators for ${selectedRegion}?`,
-    `What risk management actions apply to ${selectedRegion}?`,
-  ];
-
-  const handleSend = async (promptToSend?: string) => {
-    const text = promptToSend || input;
-    if (!text.trim() || sending) return;
-
-    const userMsg: ChatMessage = {
-      role: "user",
-      content: text,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    };
-
-    setMessages((prev) => [...prev, userMsg]);
-    if (!promptToSend) setInput("");
-    setSending(true);
-
-    const historyForLlm = messages.map((m) => ({ role: m.role, content: m.content }));
-    const botReply = await sendAiAssistantChatMessage(historyForLlm, text, selectedRegion, selectedCrop, userRole);
-
-    setMessages((prev) => [...prev, botReply]);
-    setSending(false);
-  };
-
-  return (
-    <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">AI DECISION SUPPORT SYSTEM</div>
-          <div className="page-title">AI Risk Analyst</div>
-          <p>Interactive tool-grounded analyst for climate risk, dam reserves, and crop exposure.</p>
-        </div>
-        <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
-          <RoleSwitcher userRole={userRole} setUserRole={setUserRole} />
-        </div>
-      </div>
-
-      {/* Context Control Bar */}
-      <div style={{ marginBottom: 20, padding: "12px 18px", background: "var(--surface-raised)", border: "1px solid var(--border)", borderRadius: "var(--radius)", display: "flex", alignItems: "center", gap: 16, flexWrap: "wrap", fontSize: 12 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span style={{ color: "var(--muted)", fontWeight: 600 }}>GOVERNORATE:</span>
-          <select
-            value={selectedRegion}
-            onChange={(e) => setSelectedRegion(e.target.value)}
-            style={{ border: "1px solid var(--border)", background: "var(--background)", color: "var(--foreground)", padding: "4px 10px", borderRadius: 4, outline: "none" }}
-          >
-            {governorates.map((g) => (
-              <option key={g} value={g}>{g}</option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <span style={{ color: "var(--muted)", fontWeight: 600 }}>CROP FOCUS:</span>
-          <select
-            value={selectedCrop}
-            onChange={(e) => setSelectedCrop(e.target.value)}
-            style={{ border: "1px solid var(--border)", background: "var(--background)", color: "var(--foreground)", padding: "4px 10px", borderRadius: 4, outline: "none" }}
-          >
-            {cropList.map((c) => (
-              <option key={c} value={c}>{c}</option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ color: "var(--muted)", fontSize: 11 }}>Active Context:</span>
-          <RiskPill>High</RiskPill>
-        </div>
-      </div>
-
-      {/* Suggested Prompts Strip */}
-      <div style={{ marginBottom: 16, display: "flex", gap: 8, flexWrap: "wrap" }}>
-        {suggestedPrompts.map((p) => (
-          <button
-            key={p}
-            onClick={() => handleSend(p)}
-            style={{
-              padding: "6px 12px",
-              borderRadius: 20,
-              border: "1px solid var(--border)",
-              background: "var(--surface-raised)",
-              color: "var(--secondary)",
-              fontSize: 11,
-              cursor: "pointer",
-            }}
-          >
-            {p}
-          </button>
-        ))}
-      </div>
-
-      {/* Chat Messages Window */}
-      <div style={{ border: "1px solid var(--border)", borderRadius: "var(--radius)", background: "var(--surface-raised)", padding: 20, minHeight: 380, maxHeight: 520, overflowY: "auto", display: "flex", flexDirection: "column", gap: 16, marginBottom: 16 }}>
-        {messages.map((m, idx) => (
-          <div
-            key={idx}
-            style={{
-              alignSelf: m.role === "user" ? "flex-end" : "flex-start",
-              maxWidth: "80%",
-              background: m.role === "user" ? "var(--navy)" : "var(--background)",
-              color: m.role === "user" ? "#ffffff" : "var(--foreground)",
-              padding: "12px 16px",
-              borderRadius: 10,
-              border: m.role === "assistant" ? "1px solid var(--border)" : "none",
-              fontSize: 13,
-              lineHeight: 1.55,
-            }}
-          >
-            <div style={{ fontSize: 10, opacity: 0.7, marginBottom: 4, display: "flex", justifyContent: "space-between", gap: 12 }}>
-              <span>{m.role === "user" ? "You" : "AgriRisk AI Analyst"}</span>
-              <span>{m.timestamp}</span>
-            </div>
-            <div style={{ whiteSpace: "pre-wrap" }}>{m.content}</div>
-            {m.toolsUsed && m.toolsUsed.length > 0 && (
-              <div style={{ marginTop: 8, paddingTop: 6, borderTop: "1px solid var(--border)", fontSize: 10, color: "var(--muted)", display: "flex", gap: 6, alignItems: "center" }}>
-                <Icon name="sparkles" size={12} />
-                <span>Tools queried: {m.toolsUsed.join(", ")}</span>
-              </div>
-            )}
-          </div>
-        ))}
-        {sending && (
-          <div style={{ alignSelf: "flex-start", background: "var(--background)", padding: "10px 16px", borderRadius: 10, border: "1px solid var(--border)", fontSize: 12, color: "var(--secondary)", display: "flex", alignItems: "center", gap: 8 }}>
-            <span className="spinner" /> Analyzing measured climate & reservoir data...
-          </div>
-        )}
-      </div>
-
-      {/* Chat Input Bar */}
-      <div style={{ display: "flex", gap: 10 }}>
-        <input
-          type="text"
-          placeholder={`Ask the AI Risk Analyst about ${selectedRegion} climate, dams, or crops...`}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => e.key === "Enter" && handleSend()}
-          style={{ flex: 1, padding: "12px 16px", borderRadius: "var(--radius)", border: "1px solid var(--border-strong)", background: "var(--surface-raised)", color: "var(--foreground)", outline: "none", fontSize: 13 }}
-        />
-        <button
-          className="role-btn active"
-          onClick={() => handleSend()}
-          disabled={sending || !input.trim()}
-          style={{ padding: "0 22px", display: "flex", alignItems: "center", gap: 8 }}
-        >
-          <Icon name="send" size={15} /> Send
-        </button>
-      </div>
-    </>
-  );
-}
-
-/**
- * Dedicated Crop Vulnerability & Exposure Explorer Page
- */
-function CropsPage({ selectedRegion, setSelectedRegion }: { selectedRegion: string; setSelectedRegion: (r: string) => void }) {
-  const [filterLevel, setFilterLevel] = useState<string>("All");
-
-  const weather = useMemo(() => {
-    return { total_precipitation_mm: 195.0, mean_soil_moisture: 0.115 };
-  }, [selectedRegion]);
-
-  const damInfo = useMemo(() => getDamStatusForGovernorate(selectedRegion), [selectedRegion]);
-  const crops = useMemo(() => getCropList(), []);
-  const governorates = useMemo(() => Object.keys(TUNISIA_REGIONS), []);
-
-  const cropExposures = useMemo(() => {
-    return crops.map((cropName) => {
-      const profile = CROP_PROFILES[cropName];
-      const exp = calculateCropExposure(cropName, weather.total_precipitation_mm, weather.mean_soil_moisture, damInfo.per_dam_fill_pct);
-      return {
-        profile,
-        exp,
-      };
-    });
-  }, [crops, selectedRegion, weather, damInfo]);
-
-  const filtered = useMemo(() => {
-    if (filterLevel === "All") return cropExposures;
-    return cropExposures.filter((item) => item.exp?.exposureLevel === filterLevel);
-  }, [cropExposures, filterLevel]);
-
-  return (
-    <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">CROP SENSITIVITY & REGIONAL EXPOSURE</div>
-          <div className="page-title">Crop Vulnerability Explorer</div>
-          <p>Regional climate and reservoir conditions evaluated against crop-specific water requirements.</p>
-        </div>
-      </div>
-
-      {/* Control Strip */}
-      <div style={{ marginBottom: 24, padding: "14px 18px", background: "var(--surface-raised)", border: "1px solid var(--border)", borderRadius: "var(--radius)", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 16 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-          <span style={{ fontSize: 12, fontWeight: 600, color: "var(--muted)" }}>Select Governorate:</span>
-          <select
-            value={selectedRegion}
-            onChange={(e) => setSelectedRegion(e.target.value)}
-            style={{ border: "1px solid var(--border)", background: "var(--background)", color: "var(--foreground)", padding: "6px 12px", borderRadius: 4, outline: "none", fontSize: 12, fontWeight: 600 }}
-          >
-            {governorates.map((g) => (
-              <option key={g} value={g}>{g}</option>
-            ))}
-          </select>
-        </div>
-
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <span style={{ fontSize: 11, color: "var(--muted)" }}>Filter Exposure:</span>
-          {["All", "Critical", "High", "Moderate", "Low"].map((level) => (
-            <button
-              key={level}
-              onClick={() => setFilterLevel(level)}
-              style={{
-                padding: "4px 10px",
-                borderRadius: 4,
-                border: `1px solid ${filterLevel === level ? "var(--accent)" : "var(--border)"}`,
-                background: filterLevel === level ? "var(--accent-light)" : "var(--background)",
-                color: filterLevel === level ? "var(--accent)" : "var(--foreground)",
-                fontSize: 11,
-                cursor: "pointer",
-              }}
-            >
-              {level}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {/* Crop Grid */}
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(320px, 1fr))", gap: 18 }}>
-        {filtered.map(({ profile, exp }) => (
-          <div
-            key={profile.name}
-            style={{
-              background: "var(--surface-raised)",
-              border: "1px solid var(--border)",
-              borderRadius: "var(--radius)",
-              padding: 18,
-              boxShadow: "0 4px 12px var(--shadow)",
-              display: "flex",
-              flexDirection: "column",
-              justifyContent: "space-between",
-            }}
-          >
-            <div>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <Icon name="sprout" size={20} />
-                  <strong style={{ fontSize: 16, color: "var(--navy)" }}>{profile.name}</strong>
-                </div>
-                {exp && <RiskPill>{exp.exposureLevel}</RiskPill>}
-              </div>
-              <p style={{ fontSize: 12, color: "var(--secondary)", margin: "0 0 14px", lineHeight: 1.5 }}>
-                {profile.profile_note}
-              </p>
-            </div>
-
-            <div style={{ borderTop: "1px solid var(--border)", paddingTop: 12, fontSize: 11, display: "flex", flexDirection: "column", gap: 6 }}>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--muted)" }}>Water Requirement:</span>
-                <strong>{profile.water_need_mm} mm / season</strong>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--muted)" }}>Drought Sensitivity:</span>
-                <strong>{profile.drought_sensitivity} / 5</strong>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--muted)" }}>Peak Demand Stage:</span>
-                <strong style={{ textAlign: "right" }}>{profile.peak_water_demand}</strong>
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}>
-                <span style={{ color: "var(--muted)" }}>Production System:</span>
-                <strong>{profile.production_system}</strong>
-              </div>
-              {exp && (
-                <div style={{ marginTop: 6, paddingTop: 6, borderTop: "1px dashed var(--border)", display: "flex", justifyContent: "space-between", color: "var(--navy)", fontWeight: 600 }}>
-                  <span>Regional Exposure Score:</span>
-                  <span>{exp.exposureScore} / 100</span>
-                </div>
-              )}
-            </div>
-          </div>
-        ))}
-      </div>
-    </>
-  );
-}
-
-function RegionPage({ selectedRegion, userRole }: { selectedRegion: string; userRole: UserRole }) {
-  const damInfo = getDamStatusForGovernorate(selectedRegion);
-
-  return (
-    <>
-      <div className="region-hero">
-        <div className="section-label">REGIONAL ANALYSIS · CENTRAL TUNISIA</div>
-        <div className="region-title-line">
-          <div className="page-title">{selectedRegion}</div>
-          <RiskPill>{damInfo.per_dam_fill_pct < 30 ? "High" : damInfo.per_dam_fill_pct < 45 ? "Moderate" : "Low"}</RiskPill>
-        </div>
-        <p>
-          Water stress and persistent rainfall deficits are reinforcing a high-risk outlook. Confidence is strongest in reservoir and precipitation signals.
-        </p>
-      </div>
-
-      <div className="comparison-bar">
-        <span>Composite risk</span>
-        <strong>78 / 100</strong>
-        <div><i style={{ width: "78%" }}></i></div>
-        <small>National average 73</small>
-      </div>
-
-      <section className="analysis-sections">
-        {[
-          [
-            "Climate",
-            [
-              ["Rainfall", "−34.2%", "vs normal"],
-              ["Soil moisture", "22nd", "percentile"],
-              ["Reference ET₀", "+11.8%", "vs average"],
-            ],
-          ],
-          [
-            "Water Resources",
-            [
-              ["Dam fill", `${damInfo.per_dam_fill_pct}%`, damInfo.worst_dam_name],
-              ["Regional stock", "19 Mm³", "−41% YoY"],
-              ["Seasonal inflow", "8.4 Mm³", "12-month"],
-            ],
-          ],
-          [
-            "Risk Drivers",
-            [
-              ["Rainfall deficit", "High", "34% weight"],
-              ["Reservoir stress", "High", "31% weight"],
-              ["Inflow trend", "Elevated", "21% weight"],
-            ],
-          ],
-        ].map(([title, items]) => (
-          <div className="analysis-block" key={title as string}>
-            <div className="section-title">{title as string}</div>
-            {(items as string[][]).map(([label, value, note]) => (
-              <div className="comparison-row" key={label}>
-                <span>{label}</span>
-                <strong>{value}</strong>
-                <small>{note}</small>
-                <div>
-                  <i style={{ width: value.includes("High") || value.includes("34%") ? "82%" : "58%" }}></i>
-                </div>
-              </div>
-            ))}
-          </div>
-        ))}
-      </section>
-    </>
-  );
-}
-
-function WaterPage() {
-  const [search, setSearch] = useState("");
-
-  const filteredDams = useMemo(() => {
-    return TUNISIA_DAMS.filter(
-      (d) =>
-        d.name.toLowerCase().includes(search.toLowerCase()) ||
-        d.governorate.toLowerCase().includes(search.toLowerCase()) ||
-        d.region.toLowerCase().includes(search.toLowerCase())
-    );
-  }, [search]);
-
-  const exportCsv = () => {
-    const header = "Dam_Name,Governorate,Region,Capacity_Mm3,Current_Volume_Mm3,Fill_Rate_Pct\n";
-    const rows = TUNISIA_DAMS.map(
-      (d) => `${d.name},${d.governorate},${d.region},${d.capacity_mm3},${d.current_volume_mm3},${d.fill_rate_pct}`
-    ).join("\n");
-    const blob = new Blob([header + rows], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "Tunisia_Dams_Data.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-  };
-
-  return (
-    <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">NATIONAL INFRASTRUCTURE</div>
-          <div className="page-title">Water Resources</div>
-          <p>Reservoir position, inflows and operating trends across Tunisia.</p>
-        </div>
-        <div style={{ display: "flex", gap: 10 }}>
-          <Action onClick={exportCsv}>
-            <Icon name="download" size={15} /> Export data
-          </Action>
-        </div>
-      </div>
-
-      <section className="zone-strip">
-        <div>
-          <span>North</span>
-          <strong>924 Mm³</strong>
-          <small>42.1% fill</small>
-        </div>
-        <div>
-          <span>Centre</span>
-          <strong>221 Mm³</strong>
-          <small>31.7% fill</small>
-        </div>
-        <div>
-          <span>Cap Bon</span>
-          <strong>105 Mm³</strong>
-          <small>28.9% fill</small>
-        </div>
-      </section>
-
-      <div style={{ margin: "24px 0 12px", display: "flex", gap: 12, alignItems: "center" }}>
-        <div className="search" style={{ width: 280 }}>
-          <Icon name="search" size={16} />
-          <input
-            type="text"
-            placeholder="Search dam or governorate..."
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            style={{ border: 0, background: "transparent", width: "100%", outline: "none", fontSize: 11 }}
-          />
-        </div>
-        <small style={{ color: "var(--secondary)" }}>Showing {filteredDams.length} of {TUNISIA_DAMS.length} dams</small>
-      </div>
-
-      <section className="editorial-table">
-        <div className="dam-row dam-head">
-          <span>Dam / Governorate</span>
-          <span>Capacity</span>
-          <span>Current stock</span>
-          <span>Fill</span>
-          <span>Inflow</span>
-          <span>12-month trend</span>
-        </div>
-        {filteredDams.map((dam) => (
-          <div className="dam-row" key={dam.name}>
-            <span>
-              <strong>{dam.name}</strong>
-              <small>{dam.governorate}</small>
-            </span>
-            <span>{dam.capacity_mm3} Mm³</span>
-            <span>{dam.current_volume_mm3} Mm³</span>
-            <span>
-              <strong>{dam.fill_rate_pct}%</strong>
-            </span>
-            <span className="warning">−18%</span>
-            <MiniTrend values={dam.history} />
-          </div>
-        ))}
-      </section>
-    </>
-  );
-}
-
-function ScenariosPage() {
-  const [rain, setRain] = useState(-20);
-  const [inflow, setInflow] = useState(-25);
-  const [stock, setStock] = useState(-15);
-
-  const simulated = useMemo(() => {
-    return Math.round(73 - rain * 0.28 - inflow * 0.14 - stock * 0.18);
-  }, [rain, inflow, stock]);
-
-  return (
-    <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">FORWARD RISK ASSESSMENT & STRESS TESTING</div>
-          <div className="page-title">Scenario Analysis</div>
-          <p>
-            Simulate how hypothetical shifts in annual rainfall, dam inflows, and water reserves alter regional climate risk scores across Tunisia.
-          </p>
-        </div>
-      </div>
-
-      <div style={{ marginBottom: 24, padding: 16, background: "var(--surface-raised)", border: "1px solid var(--border)", borderRadius: "var(--radius)", fontSize: 12, color: "var(--secondary)" }}>
-        <strong style={{ color: "var(--navy)", display: "block", marginBottom: 4 }}>What is Scenario Analysis?</strong>
-        This simulator runs a deterministic what-if assessment. Adjusting the parameters below recalculates composite national risk scores and allows underwriters and agronomists to stress-test financial portfolios and field plans against drought intensification or climate recovery.
-      </div>
-
-      <section className="scenario-layout">
-        <div className="scenario-controls">
-          {[
-            ["Rainfall Anomaly", rain, setRain],
-            ["Seasonal Inflow Change", inflow, setInflow],
-            ["Water Reservoir Stock", stock, setStock],
-          ].map(([label, value, setter]) => (
-            <div className="control-row" key={label as string}>
-              <div>
-                <span>{label as string}</span>
-                <strong>
-                  {Number(value) > 0 ? "+" : ""}
-                  {value as number}%
-                </strong>
-              </div>
-              <input
-                type="range"
-                min="-50"
-                max="20"
-                value={value as number}
-                onChange={(event) =>
-                  (setter as React.Dispatch<React.SetStateAction<number>>)(Number(event.target.value))
-                }
-              />
-              <small>
-                <span>−50% (Severe Deficit)</span>
-                <span>Baseline</span>
-                <span>+20% (Recovery)</span>
-              </small>
-            </div>
-          ))}
-        </div>
         <div className="risk-comparison">
           <div className="comparison-cards-row">
             <div className="scenario-metric-box">
-              <span className="box-label">Current Baseline Risk</span>
-              <strong className="box-score">73</strong>
-              <RiskPill>High</RiskPill>
+              <span className="box-label">Baseline</span>
+              <strong className="box-score">{data?.risk_before.level_label ?? "—"}</strong>
+              <small className="muted">measured conditions</small>
             </div>
-            <Icon name="arrow" size={22} />
+            <Icon name="arrow" size={20} />
             <div className="scenario-metric-box">
-              <span className="box-label">Simulated Scenario Risk</span>
-              <strong className="box-score">{simulated}</strong>
-              <RiskPill>{simulated >= 70 ? "High" : simulated >= 45 ? "Moderate" : "Low"}</RiskPill>
+              <span className="box-label">Scenario</span>
+              <strong className="box-score">
+                {scenario.loading && !data ? "…" : (data?.risk_after.level_label ?? "—")}
+              </strong>
+              <small className="muted">
+                {data ? `${signed(data.scenario.rainfall_change_pct, 0)}% rainfall` : "computing"}
+              </small>
             </div>
           </div>
-          <p style={{ margin: 0, color: "var(--secondary)", fontSize: 12 }}>
-            The selected scenario modifies composite risk by {simulated - 73 > 0 ? `+${simulated - 73}` : simulated - 73} points, shifting {simulated >= 70 ? "16 of 22" : simulated >= 50 ? "11 of 22" : "5 of 22"} governorates into high risk classification.
+
+          {data?.crop_exposure_before && data.crop_exposure_after ? (
+            <div className="comparison-cards-row">
+              <div className="scenario-metric-box">
+                <span className="box-label">{crop} exposure before</span>
+                <strong className="box-score">{data.crop_exposure_before.score ?? "—"}</strong>
+                <small className="muted">{data.crop_exposure_before.level ?? "not scored"}</small>
+              </div>
+              <Icon name="arrow" size={20} />
+              <div className="scenario-metric-box">
+                <span className="box-label">{crop} exposure after</span>
+                <strong className="box-score">{data.crop_exposure_after.score ?? "—"}</strong>
+                <small className="muted">
+                  {exposureShift == null ? "not scored" : `${signed(exposureShift, 0)} points`}
+                </small>
+              </div>
+            </div>
+          ) : null}
+
+          <p>
+            {scenario.error ??
+              data?.note ??
+              "Adjust the rainfall change to re-run the model. National fetches are cached for five minutes, so repeated slider moves stay responsive."}
           </p>
-        </div>
-      </section>
-    </>
-  );
-}
 
-function ClimatePage() {
-  const regions = useMemo(() => Object.keys(TUNISIA_REGIONS), []);
-
-  return (
-    <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">AGRO-CLIMATIC MONITORING</div>
-          <div className="page-title">Climate & Soil Moisture</div>
-          <p>Observed temperature, cumulative precipitation, and topsoil moisture across Tunisian governorates.</p>
-        </div>
-      </div>
-      <section className="report-list">
-        <div className="report-row report-head">
-          <span>Governorate</span>
-          <span>Precipitation (mm)</span>
-          <span>Soil Moisture (0-7cm)</span>
-          <span>Temperature (°C)</span>
-          <span>Risk Status</span>
-        </div>
-        {regions.map((name) => {
-          const dam = getDamStatusForGovernorate(name);
-          const riskText = dam.per_dam_fill_pct < 30 ? "High" : dam.per_dam_fill_pct < 45 ? "Moderate" : "Low";
-          return (
-            <div className="report-row" key={name}>
-              <strong>{name}</strong>
-              <span>110.5 mm</span>
-              <span>0.085 m³/m³</span>
-              <span>21.4 °C</span>
-              <RiskPill>{riskText}</RiskPill>
+          {data?.changed === false ? (
+            <div className="watch-note">
+              <span>No model change</span>
+              <p>This scenario does not push the region across a risk threshold.</p>
             </div>
-          );
-        })}
-      </section>
+          ) : null}
+
+          {data?.drivers_after?.length ? (
+            <>
+              <span className="box-label">Drivers after scenario</span>
+              {data.drivers_after.map((driver) => (
+                <div className="comparison-row" key={driver.indicator}>
+                  <span>{driver.indicator}</span>
+                  <strong>{driver.value}</strong>
+                  <small>{driver.signal}</small>
+                </div>
+              ))}
+            </>
+          ) : null}
+
+          <SourceNote>{data?.source ?? "AgriRisk risk model · Open-Meteo rainfall anomaly"}</SourceNote>
+        </div>
+      </div>
     </>
   );
 }
 
-function ReportsPage({ userRole }: { userRole: UserRole }) {
-  const reports = [
-    ["Quarterly National Water Risk Review", "06 Jan 2025", "Tunisia", "High"],
-    ["Central Governorates Exposure Brief", "18 Dec 2024", "Central Tunisia", "High"],
-    ["Northern Reservoir Resilience Note", "02 Dec 2024", "North", "Moderate"],
-    ["Rainfall Anomaly Monthly Monitor", "30 Nov 2024", "Tunisia", "Moderate"],
-  ];
+// ---------------------------------------------------------------------------
+// Reports
+// ---------------------------------------------------------------------------
+function ReportsPage({
+  region,
+  setRegion,
+  governorates,
+  crops,
+  userRole,
+}: {
+  region: string;
+  setRegion: (value: string) => void;
+  governorates: string[];
+  crops: string[];
+  userRole: UserRole;
+}) {
+  const [crop, setCrop] = useState("");
+  const [kind, setKind] = useState<string>("assessment");
+  const reports = useReports(region, crop || null);
+  const assessment = useAssessment(region, crop || null);
+  const history = useWaterSummary();
+  const entries = reports.data?.reports ?? [];
+  const selectedEntry = entries.find((entry) => entry.kind === kind) ?? entries[0] ?? null;
+
+  const exportCsv = () => {
+    if (!entries.length) return;
+    downloadText(
+      `AgriRisk_reports_${region.replace(/\s+/g, "_")}.csv`,
+      toCsv(
+        ["id", "kind", "title", "coverage", "date", "risk_level", "risk_label", "summary"],
+        entries.map((entry) => [
+          entry.id,
+          entry.kind,
+          entry.title,
+          entry.coverage,
+          entry.date,
+          entry.risk_level,
+          entry.risk_label,
+          entry.summary,
+        ]),
+      ),
+      "text/csv",
+    );
+  };
+
+  const brief =
+    assessment.data && selectedEntry?.kind === "assessment"
+      ? buildBrief(assessment.data, userRole, crop, "current", null)
+      : null;
 
   return (
     <>
-      <div className="page-intro">
-        <div>
-          <div className="section-label">RESEARCH & DISTRIBUTION</div>
-          <div className="page-title">Reports</div>
-          <p>Decision-ready analysis for investment, underwriting and portfolio teams.</p>
-        </div>
-      </div>
-      <section className="report-list">
-        <div className="report-row report-head">
+      <PageIntro
+        eyebrow="Reports"
+        title="Report centre"
+        description="Every report is generated from the same measured indicators used across the dashboard. Nothing here is pre-written."
+        actions={
+          <>
+            <GovernorateField value={region} options={governorates} onChange={setRegion} />
+            <Select label="Crop" id="report-crop" value={crop} options={["", ...crops]} onChange={setCrop} />
+            <Button onClick={exportCsv} disabled={!entries.length}>
+              <Icon name="download" size={14} /> Export index
+            </Button>
+          </>
+        }
+      />
+
+      <div className="report-list">
+        <div className="report-head report-row">
           <span>Report</span>
-          <span>Date</span>
           <span>Coverage</span>
-          <span>Risk level</span>
-          <span>Actions</span>
+          <span>Date</span>
+          <span>Risk</span>
+          <span />
         </div>
-        {reports.map((report) => (
-          <div className="report-row" key={report[0]}>
-            <strong>{report[0]}</strong>
-            <span>{report[1]}</span>
-            <span>{report[2]}</span>
-            <RiskPill>{report[3]}</RiskPill>
-            <div>
-              <Action className="text-action">View</Action>
-              <Action className="text-action">PDF</Action>
-              <Action className="text-action">CSV</Action>
+        <DataState loading={reports.loading} error={reports.error} empty={!entries.length}>
+          {entries.map((entry) => (
+            <button
+              type="button"
+              key={entry.id}
+              className={`report-row row-button${selectedEntry?.id === entry.id ? " is-selected" : ""}`}
+              onClick={() => setKind(entry.kind)}
+            >
+              <span>
+                <strong>{entry.title}</strong>
+                <small className="muted">{entry.summary}</small>
+              </span>
+              <span>{entry.coverage}</span>
+              <span>{formatDate(entry.date)}</span>
+              <span>
+                <RiskPill tone={toneFromText(entry.risk_level)}>{entry.risk_label ?? "—"}</RiskPill>
+              </span>
+              <span>
+                <Icon name="chevron" size={14} />
+              </span>
+            </button>
+          ))}
+        </DataState>
+      </div>
+
+      <div className="ai-report-container">
+        <div className="ai-report-header">
+          <h3>{selectedEntry?.title ?? "Risk brief"}</h3>
+          <div className="panel-actions">
+            {brief ? (
+              <Button onClick={() => downloadText(`AgriRisk_${region.replace(/\s+/g, "_")}_brief.txt`, brief)}>
+                <Icon name="download" size={14} /> Download .txt
+              </Button>
+            ) : null}
+          </div>
+        </div>
+        <DataState
+          loading={assessment.loading && !assessment.data}
+          error={assessment.error}
+          empty={!selectedEntry}
+        >
+          {selectedEntry && brief ? (
+            <>
+              <div className="ai-report-content">{brief}</div>
+              {assessment.data ? (
+                <div className="ai-metrics-row">
+                  <div className="ai-metric-card">
+                    <span>Risk level</span>
+                    <strong>{assessment.data.risk.level_label}</strong>
+                  </div>
+                  <div className="ai-metric-card">
+                    <span>Rainfall anomaly</span>
+                    <strong>{signedPct(assessment.data.rainfall.rainfall_anomaly_pct)}</strong>
+                  </div>
+                  <div className="ai-metric-card">
+                    <span>Dam fill</span>
+                    <strong>
+                      {assessment.data.water ? `${num(assessment.data.water.dam_fill_rate_pct, 1)}%` : "n/a"}
+                    </strong>
+                  </div>
+                  <div className="ai-metric-card">
+                    <span>National stock</span>
+                    <strong>
+                      {assessment.data.water ? `${num(assessment.data.water.national_stock_mm3, 0)} Mm³` : "n/a"}
+                    </strong>
+                  </div>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <div className="ai-report-content">
+              {selectedEntry
+                ? `${selectedEntry.title} — ${selectedEntry.summary}. This report is generated from measured data and is available once the assessment for ${region} has run.`
+                : "Select a report above."}
+              {history.data ? (
+                <p className="muted">
+                  Dam dataset snapshot: {formatDate(history.data.date)} · {history.data.count} monitored dams.
+                </p>
+              ) : null}
+            </div>
+          )}
+        </DataState>
+      </div>
+    </>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Assistant
+// ---------------------------------------------------------------------------
+const SUGGESTIONS = [
+  "Which governorates are at very high drought risk right now?",
+  "How much water is stored nationally versus the three-year average?",
+  "What is the rainfall anomaly for my selected governorate?",
+  "Which monitored dams are below 30% fill?",
+  "How exposed is olive oil to the current conditions?",
+  "Summarise the recommended action for my region.",
+];
+
+function AssistantPage({
+  region,
+  setRegion,
+  governorates,
+  crops,
+  crop,
+  setCrop,
+}: {
+  region: string;
+  setRegion: (value: string) => void;
+  governorates: string[];
+  crops: string[];
+  crop: string;
+  setCrop: (value: string) => void;
+}) {
+  const health = useHealth();
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
+  }, [messages, sending]);
+
+  const send = useCallback(
+    async (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || sending) return;
+
+      const history = messages.map((message) => ({ role: message.role, content: message.content }));
+      setMessages((current) => [...current, { role: "user", content: trimmed }]);
+      setInput("");
+      setSending(true);
+      setError(null);
+
+      try {
+        const reply = await api.chat({
+          message: trimmed,
+          history,
+          governorate: region,
+          crop: crop || null,
+          period: "current",
+        });
+        setMessages((current) => [
+          ...current,
+          { role: "assistant", content: reply.reply, toolsUsed: reply.tools_used },
+        ]);
+      } catch (cause) {
+        setError(cause instanceof Error ? cause.message : String(cause));
+      } finally {
+        setSending(false);
+      }
+    },
+    [crop, messages, region, sending],
+  );
+
+  return (
+    <>
+      <PageIntro
+        eyebrow="AI assistant"
+        title="Ask AgriRisk"
+        description="The assistant answers from the same measured climate, reservoir and risk-model data as the rest of the dashboard, using server-side tools. No data leaves this deployment."
+      />
+
+      <div className="chat-container">
+        <aside className="chat-sidebar-panel">
+          <div>
+            <p className="section-label">Context</p>
+            <div className="field-stack">
+              <GovernorateField value={region} options={governorates} onChange={setRegion} />
+              <Select label="Crop" id="chat-crop" value={crop} options={["", ...crops]} onChange={setCrop} />
+            </div>
+            <p className="hint">
+              The assistant is grounded on {region}
+              {crop ? ` and ${crop}` : ""}. It calls the AgriRisk API tools rather than answering from memory.
+            </p>
+          </div>
+
+          <div>
+            <p className="section-label">Try asking</p>
+            <div className="suggestion-list">
+              {SUGGESTIONS.map((suggestion) => (
+                <button
+                  key={suggestion}
+                  type="button"
+                  className="chip"
+                  onClick={() => send(suggestion)}
+                  disabled={sending}
+                >
+                  {suggestion}
+                </button>
+              ))}
             </div>
           </div>
-        ))}
-      </section>
+
+          <div>
+            <p className="section-label">Grounding</p>
+            <ul className="tool-list">
+              <li>
+                <span className={`dot ${health.data?.status === "ok" ? "ok" : "off"}`} />
+                API {health.data ? `v${health.data.version} · ${health.data.status}` : "checking…"}
+              </li>
+              <li>
+                <span className={`dot ${health.data?.llm_configured ? "ok" : "off"}`} />
+                Assistant model {health.data?.llm_configured ? "configured" : "not configured"}
+              </li>
+              <li>
+                <span className="dot ok" />
+                {health.data?.governorates ?? 24} governorates · {health.data?.crops ?? 0} crops
+              </li>
+              <li>
+                <span className="dot ok" />
+                Dams through {formatDate(health.data?.dam_coverage.last_date)}
+              </li>
+            </ul>
+          </div>
+        </aside>
+
+        <section className="chat-main-panel">
+          <div className="chat-messages-area" ref={scrollRef}>
+            {!messages.length ? (
+              <div className="chat-message-bubble assistant">
+                <Markdown
+                  text={`Ask me anything about Tunisian agricultural risk. I can assess a **governorate**, compare **reservoir levels**, explain the **AgriRisk risk model**, or stress-test a crop with a hypothetical rainfall change.\n\nI am currently grounded on **${region}**${crop ? ` with a **${crop}** focus` : ""}.`}
+                />
+              </div>
+            ) : null}
+
+            {messages.map((message, index) => (
+              <div key={index} className={`chat-message-bubble ${message.role}`}>
+                <Markdown text={message.content} />
+                {message.toolsUsed?.length ? (
+                  <div className="tool-chips">
+                    {message.toolsUsed.map((tool) => (
+                      <span key={tool}>{tool}</span>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+            ))}
+
+            {sending ? (
+              <div className="chat-message-bubble assistant">
+                <Spinner label="Consulting AgriRisk tools…" />
+              </div>
+            ) : null}
+            {error ? (
+              <div className="chat-message-bubble assistant is-error">
+                <strong>Assistant unavailable</strong>
+                <p>{error}</p>
+              </div>
+            ) : null}
+          </div>
+
+          <form
+            className="chat-input-bar"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void send(input);
+            }}
+          >
+            <input
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              placeholder={`Ask about ${region}…`}
+              aria-label="Message"
+              disabled={sending}
+            />
+            <Button type="submit" variant="primary" disabled={sending || !input.trim()}>
+              <Icon name="send" size={14} /> Send
+            </Button>
+          </form>
+        </section>
+      </div>
     </>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
 function SearchModal({
-  isOpen,
+  governorates,
+  crops,
   onClose,
-  onSelectRegion,
+  onPick,
 }: {
-  isOpen: boolean;
+  governorates: string[];
+  crops: string[];
   onClose: () => void;
-  onSelectRegion: (region: string) => void;
+  onPick: (page: PageKey, value?: string) => void;
 }) {
   const [query, setQuery] = useState("");
+  const needle = query.trim().toLowerCase();
+  const pages = NAV.map((item) => item.key);
+  const results: { label: string; hint: string; run: () => void }[] = [
+    ...pages.map((page) => ({
+      label: page,
+      hint: "Page",
+      run: () => onPick(page),
+    })),
+    ...governorates.map((name) => ({
+      label: name,
+      hint: "Governorate",
+      run: () => onPick("Regions", name),
+    })),
+    ...crops.map((name) => ({
+      label: name,
+      hint: "Crop",
+      run: () => onPick("Crops", name),
+    })),
+  ].filter((item) => !needle || item.label.toLowerCase().includes(needle));
 
-  if (!isOpen) return null;
-
-  const results = Object.keys(TUNISIA_REGIONS).filter((r) =>
-    r.toLowerCase().includes(query.toLowerCase())
-  );
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="search-modal" onClick={(e) => e.stopPropagation()}>
+      <div className="search-modal" onClick={(event) => event.stopPropagation()}>
         <div className="search-modal-header">
-          <Icon name="search" size={18} />
+          <Icon name="search" size={16} />
           <input
-            type="text"
-            placeholder="Search governorates or reservoirs..."
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
             autoFocus
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search pages, governorates, crops…"
+            aria-label="Search"
           />
-          <Action className="icon-action" onClick={onClose}>
-            <Icon name="x" size={16} />
-          </Action>
+          <Button variant="ghost" onClick={onClose}>
+            <Icon name="x" size={15} />
+          </Button>
         </div>
         <div className="search-modal-results">
-          {results.map((gov) => (
+          {results.slice(0, 40).map((item) => (
             <div
+              key={`${item.hint}-${item.label}`}
               className="search-modal-item"
-              key={gov}
               onClick={() => {
-                onSelectRegion(gov);
+                item.run();
                 onClose();
               }}
             >
-              <strong>{gov}</strong>
-              <small style={{ color: "var(--muted)" }}>Governorate</small>
+              <span>{item.label}</span>
+              <small className="muted">{item.hint}</small>
             </div>
           ))}
+          {!results.length ? <div className="search-modal-item muted">No matches</div> : null}
         </div>
       </div>
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// App shell
+// ---------------------------------------------------------------------------
 export default function App() {
-  const [active, setActive] = useState("Overview");
+  const [page, setPageState] = useState<PageKey>(() => {
+    if (typeof window === "undefined") return "Overview";
+    const requested = new URLSearchParams(window.location.search).get("page");
+    return NAV.find((item) => item.key === requested)?.key ?? "Overview";
+  });
   const [dark, setDark] = useState(false);
   const [userRole, setUserRole] = useState<UserRole>("Insurer / Analyst");
-  const [selectedRegion, setSelectedRegion] = useState("Kairouan");
+  const [period, setPeriod] = useState("current");
+  const [region, setRegion] = useState("Kairouan");
+  const [crop, setCrop] = useState("");
   const [searchOpen, setSearchOpen] = useState(false);
 
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
-        e.preventDefault();
-        setSearchOpen((prev) => !prev);
-      }
-    };
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
+  const health = useHealth();
+  const reference = useReference();
+  const governorates = reference.data?.governorates ?? [];
+  const crops = reference.data?.crops ?? [];
+
+  // Navigation is state-based, but the current page is mirrored into the query
+  // string so any view can be linked to and reloaded.
+  const setPage = useCallback((next: PageKey) => {
+    setPageState(next);
+    const url = new URL(window.location.href);
+    if (next === "Overview") url.searchParams.delete("page");
+    else url.searchParams.set("page", next);
+    window.history.replaceState(null, "", url);
   }, []);
 
-  let content: React.ReactNode;
-  switch (active) {
-    case "AI Assistant":
-      content = (
-        <AssistantPage
-          userRole={userRole}
-          setUserRole={setUserRole}
-          selectedRegion={selectedRegion}
-          setSelectedRegion={setSelectedRegion}
-        />
-      );
-      break;
-    case "Crops":
-      content = (
-        <CropsPage
-          selectedRegion={selectedRegion}
-          setSelectedRegion={setSelectedRegion}
-        />
-      );
-      break;
-    case "Regions":
-      content = <RegionPage selectedRegion={selectedRegion} userRole={userRole} />;
-      break;
-    case "Water":
-      content = <WaterPage />;
-      break;
-    case "Climate":
-      content = <ClimatePage />;
-      break;
-    case "Scenarios":
-      content = <ScenariosPage />;
-      break;
-    case "Reports":
-      content = <ReportsPage userRole={userRole} />;
-      break;
-    default:
-      content = (
-        <Overview
-          userRole={userRole}
-          setUserRole={setUserRole}
-          selectedRegion={selectedRegion}
-          setSelectedRegion={setSelectedRegion}
-          onNavigateToRegions={() => setActive("Regions")}
-        />
-      );
-  }
+  const periodKeys = useMemo(() => {
+    const keys = Object.keys(reference.data?.periods ?? {});
+    return ["current", ...keys.filter((key) => key !== "current")];
+  }, [reference.data]);
+  const periodLabel = reference.data?.periods?.[period] ?? period;
+  // Raw period keys such as "last_year" are for the API; the switcher shows the
+  // human window labels the backend supplies.
+  const periodLabels = useMemo(() => {
+    const labels: Record<string, string> = { current: "Current" };
+    for (const [key, label] of Object.entries(reference.data?.periods ?? {})) {
+      if (key !== "current") labels[key] = String(label).replace(/\s*\(.*\)\s*$/, "");
+    }
+    return labels;
+  }, [reference.data]);
+
+  useEffect(() => {
+    if (!governorates.length) return;
+    if (!governorates.includes(region)) setRegion(governorates.includes("Kairouan") ? "Kairouan" : governorates[0]);
+  }, [governorates, region]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setSearchOpen(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
+  const goTo = (next: PageKey, value?: string) => {
+    if (value) {
+      if (next === "Crops" || next === "Assistant") setCrop(value);
+      else setRegion(value);
+    }
+    setPage(next);
+  };
+
+  const shared = { period, region, setRegion, governorates, crops };
 
   return (
-    <div className={`app ${dark ? "dark" : ""}`}>
+    <div className={dark ? "app dark" : "app"}>
       <aside className="sidebar">
         <div className="wordmark">
-          <span></span>AgriRisk
+          <span />
+          AgriRisk
         </div>
         <nav>
-          {nav.map(([label, icon]) => (
+          {NAV.map((item) => (
             <div
+              key={item.key}
+              className={`nav-item${page === item.key ? " active" : ""}`}
+              onClick={() => setPage(item.key)}
               role="button"
               tabIndex={0}
-              className={`nav-item ${active === label ? "active" : ""}`}
-              key={label}
-              onClick={() => setActive(label)}
+              aria-current={page === item.key}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") setPage(item.key);
+              }}
             >
-              <Icon name={icon} />
-              <span>{label}</span>
+              <Icon name={item.icon} />
+              <span>{item.key}</span>
             </div>
           ))}
         </nav>
         <div className="sidebar-foot">
-          <span>Data status</span>
+          <span>Data sources</span>
           <strong>
-            <i></i> All systems operational
+            <i style={{ background: health.data?.status === "ok" ? "var(--low)" : "var(--danger)" }} />
+            {health.data?.status === "ok" ? "API online" : "API offline"}
           </strong>
-          <small>Updated 8 min ago</small>
+          <small>{health.data?.climate_source ?? "Open-Meteo"}</small>
+          <small>{health.data?.dam_source ?? "AgriRisk dams"}</small>
+          {health.data ? <small>AgriRisk v{health.data.version}</small> : null}
         </div>
       </aside>
 
       <main>
         <header className="topbar">
           <div className="market">
-            <span>Market</span>
-            <strong>Tunisia</strong>
-            <Icon name="chevron" size={13} />
+            <span>Period</span>
+            <Segmented
+              ariaLabel="Analysis period"
+              options={periodKeys.length ? periodKeys : ["current"]}
+              value={periodKeys.includes(period) ? period : "current"}
+              onChange={setPeriod}
+              labels={periodLabels}
+            />
           </div>
+
           <div className="top-actions">
-            <div
-              className="search"
+            <Segmented
+              ariaLabel="User profile"
+              options={["Insurer / Analyst", "Farmer / Specialist"] as const}
+              value={userRole}
+              onChange={setUserRole}
+            />
+            <button
+              type="button"
+              className="action icon-action"
               onClick={() => setSearchOpen(true)}
-              style={{ cursor: "pointer" }}
+              title="Search (Ctrl+K)"
+              aria-label="Search"
             >
-              <Icon name="search" size={16} />
-              <span>Search data and regions</span>
-              <kbd>⌘ K</kbd>
-            </div>
-            <Action className="icon-action" onClick={() => setDark(!dark)}>
-              <Icon name={dark ? "sun" : "moon"} />
-            </Action>
-            <div className="profile" title={`Role: ${userRole}`}>
-              {userRole.includes("Insurer") ? "INS" : "FAR"}
+              <Icon name="search" size={14} />
+            </button>
+            <button
+              type="button"
+              className="action icon-action"
+              onClick={() => setDark((value) => !value)}
+              title="Toggle theme"
+              aria-label="Toggle theme"
+            >
+              <Icon name={dark ? "sun" : "moon"} size={14} />
+            </button>
+            <div className="profile" title={userRole}>
+              {userRole === "Insurer / Analyst" ? "IA" : "FS"}
             </div>
           </div>
         </header>
 
-        <div className="content">{content}</div>
+        <div className="content">
+          {page === "Overview" ? (
+            <OverviewPage {...shared} periodLabel={periodLabel} userRole={userRole} setPage={setPage} />
+          ) : null}
+          {page === "Regions" ? <RegionsPage {...shared} userRole={userRole} /> : null}
+          {page === "Water" ? <WaterPage /> : null}
+          {page === "Climate" ? <ClimatePage period={period} /> : null}
+          {page === "Crops" ? <CropsPage region={region} setRegion={setRegion} governorates={governorates} /> : null}
+          {page === "Scenarios" ? <ScenariosPage {...shared} /> : null}
+          {page === "Reports" ? <ReportsPage {...shared} userRole={userRole} /> : null}
+          {page === "Assistant" ? (
+            <AssistantPage
+              region={region}
+              setRegion={setRegion}
+              governorates={governorates}
+              crops={crops}
+              crop={crop}
+              setCrop={setCrop}
+            />
+          ) : null}
+        </div>
       </main>
 
-      <SearchModal
-        isOpen={searchOpen}
-        onClose={() => setSearchOpen(false)}
-        onSelectRegion={(region) => {
-          setSelectedRegion(region);
-          setActive("Overview");
-        }}
-      />
+      {searchOpen ? (
+        <SearchModal governorates={governorates} crops={crops} onClose={() => setSearchOpen(false)} onPick={goTo} />
+      ) : null}
     </div>
   );
 }

@@ -7,6 +7,7 @@ and soil-moisture / ET0 indicators shared by the dashboard and the AI analyst.
 
 import datetime as dt
 import threading
+import time
 
 import requests
 
@@ -26,6 +27,13 @@ PERIODS = {
 
 _CACHE = {}
 _CACHE_LOCK = threading.Lock()
+
+# Open-Meteo is a free public endpoint and rate-limits bursts. The API
+# assesses every governorate at once, so a throttled request must be retried
+# rather than reported as missing data.
+_MAX_ATTEMPTS = 4
+_BACKOFF_SECONDS = (1.0, 2.5, 5.0)
+_TIMEOUT_SECONDS = 25
 
 
 def available_periods():
@@ -82,18 +90,43 @@ def _fetch_daily(region, start, end):
       "timezone": "auto",
   }
   try:
-    response = requests.get(OPEN_METEO_URL, params=params, timeout=25)
+    daily, error = _request_with_retry(params)
   except requests.RequestException as exc:
     return {"error": f"Open-Meteo request failed: {exc}"}
-  if response.status_code != 200:
-    return {"error": f"Open-Meteo API error: {response.text[:200]}"}
-  daily = response.json().get("daily") or {}
+  if error:
+    return {"error": error}
   if not daily or not daily.get("time"):
     return {"error": "No daily data returned from Open-Meteo."}
 
   with _CACHE_LOCK:
     _CACHE[key] = (dt.datetime.now().timestamp() + CLIMATE_CACHE_TTL_SECONDS, daily)
   return daily
+
+
+def _request_with_retry(params):
+  """GET the Open-Meteo archive with backoff on 429 / 5xx / transport errors.
+
+  Returns `(daily_fields, error_message)`; exactly one is set.
+  """
+  last_error = "unknown error"
+  for attempt in range(_MAX_ATTEMPTS):
+    try:
+      response = requests.get(
+          OPEN_METEO_URL, params=params, timeout=_TIMEOUT_SECONDS
+      )
+    except requests.RequestException as exc:
+      last_error = str(exc)
+    else:
+      if response.status_code == 200:
+        return (response.json() or {}).get("daily") or {}, None
+      last_error = f"HTTP {response.status_code}: {response.text[:160]}"
+      # 4xx other than 429 will not improve on retry.
+      if response.status_code < 500 and response.status_code != 429:
+        break
+    if attempt < len(_BACKOFF_SECONDS):
+      time.sleep(_BACKOFF_SECONDS[attempt])
+
+  return None, f"Open-Meteo request failed: {last_error}"
 
 
 def _values(daily, field):
